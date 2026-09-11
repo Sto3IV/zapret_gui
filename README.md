@@ -2,7 +2,7 @@
 
 Графический интерфейс для управления деревом Zapret в среде Windows: управление системными службами, редактирование списков обхода и безопасный доступ к файлу `hosts`.
 
-![Zapret Control GUI](assets/zapret_gui_preview.png)
+![Zapret Control GUI](assets/zapret_gui_main.png)
 
 ---
 
