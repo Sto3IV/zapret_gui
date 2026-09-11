@@ -1,0 +1,5 @@
+# Runtime — imported by zapret_gui
+PySide6==6.11.2
+
+# Tests — imported by tests/ (pip install -r requirements.txt is sufficient to run them)
+pytest==9.1.1

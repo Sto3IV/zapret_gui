@@ -1,8 +1,31 @@
-/utils/test results
-/utils/game_filter.enabled
-/lists/ipset-exclude-user.txt
-/lists/list-general-user.txt
-/lists/list-exclude-user.txt
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tooling / OS
+.idea/
 .vscode/
-/build/
+*.log
+Thumbs.db
+desktop.ini
+
+# Editor snapshots produced by the GUI (never commit operator backups)
+lists/*.bak
+lists/*.backup
+lists/backups/
+utils/test results/
