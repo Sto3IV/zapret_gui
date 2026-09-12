@@ -25,6 +25,8 @@ def test_palette_is_primer_dark_high_contrast() -> None:
     assert PALETTE["success"].lower() == "#26cd4d"
     assert PALETTE["fg_muted"].lower() == "#9ea7b3"
     assert PALETTE["window_edge"].lower() == "#b7bdc8"
+    # Primer DHC attention-fg — the console WARN colour for advisory steps.
+    assert PALETTE["attention"].lower() == "#f0b72f"
 
 
 def test_stylesheet_is_built_from_shipped_palette() -> None:

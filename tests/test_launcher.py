@@ -176,3 +176,38 @@ def test_bat_relocates_checks_requirements_and_starts_module() -> None:
         if stripped.startswith("rem"):
             continue
         assert not stripped.startswith("start ")
+
+
+def test_bat_requests_administrator_once_at_launch() -> None:
+    """sc.exe output is only capturable in-process, which needs an elevated token."""
+    text = (ROOT / "ZapretControl.bat").read_text(encoding="utf-8")
+    lowered = text.lower()
+    assert "net session" in lowered, "missing the already-elevated probe"
+    assert "start-process" in lowered and "-verb runas" in lowered
+    # The relaunch must land back in this tree, not in System32.
+    assert "-workingdirectory '%~dp0'" in lowered
+    # ...and it must still be possible to run unelevated for CI and --smoke.
+    assert "--no-elevate" in lowered
+    assert ":elevated" in lowered
+    # The switch is consumed by the launcher, never forwarded to the GUI.
+    assert "%guiargs%" in lowered
+
+
+def test_bat_forwards_gui_arguments(tmp_path: Path) -> None:
+    """--no-elevate is stripped; everything else reaches python -m zapret_gui."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run(
+        [str(ROOT / "ZapretControl.bat"), "--no-elevate", "--smoke", "--root", str(ROOT)],
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+        env=env,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SMOKE_OK" in proc.stdout
+    assert f"PROJECT_ROOT={ROOT}" in proc.stdout
+    assert "consoleView present=True" in proc.stdout

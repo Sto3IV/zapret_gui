@@ -8,8 +8,16 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QFont, QFontDatabase, QGuiApplication, QTextCursor
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QGuiApplication,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -49,6 +57,7 @@ from zapret_gui.identity import persist_installed_strategy, strategy_stem
 from zapret_gui.services import (
     RemoveResult,
     ScmOpResult,
+    StepReport,
     install_service,
     query_service_status,
     remove_service,
@@ -64,7 +73,7 @@ from zapret_gui.strategies import (
     parse_strategy,
     save_game_filter,
 )
-from zapret_gui.theme import GUI_FONT_FAMILY, STYLESHEET
+from zapret_gui.theme import CONSOLE_FONT_FAMILY, GUI_FONT_FAMILY, PALETTE, STYLESHEET
 from zapret_gui.i18n import apply_locale, load_catalog, lookup, toggle_locale
 
 REQUIRED_OBJECT_NAMES = (
@@ -81,6 +90,8 @@ REQUIRED_OBJECT_NAMES = (
     "backupButton",
     "saveButton",
     "languageButton",
+    "consoleView",
+    "clearConsoleButton",
 )
 
 GAME_FILTER_LABELS = (
@@ -89,6 +100,40 @@ GAME_FILTER_LABELS = (
     ("tcp", "TCP only"),
     ("udp", "UDP only"),
 )
+
+# service.bat paints its console with :PrintGreen / :PrintYellow / :PrintRed.
+CONSOLE_OK = PALETTE["success"]
+CONSOLE_WARN = PALETTE["attention"]
+CONSOLE_FAIL = PALETTE["danger"]
+CONSOLE_CMD = PALETTE["accent"]
+CONSOLE_MUTED = PALETTE["fg_muted"]
+CONSOLE_TEXT = PALETTE["fg"]
+
+# The resolved binPath runs past 4000 characters; the full text already lives in
+# the args preview, so the console shows a readable head of it.
+CONSOLE_COMMAND_LIMIT = 320
+
+
+class ScmWorker(QThread):
+    """Runs one blocking SCM action off the GUI thread.
+
+    ``sc start`` can block for seconds and ``wait_for_state`` polls after it, so
+    running this inline would freeze the window for the whole install.
+    """
+
+    step = Signal(object)
+    done = Signal(object)
+
+    def __init__(self, action, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._action = action
+
+    def run(self) -> None:  # pragma: no cover - exercised only on the live path
+        try:
+            outcome = self._action(self.step.emit)
+        except Exception as exc:
+            outcome = exc
+        self.done.emit(outcome)
 
 
 class MainWindow(QMainWindow):
@@ -120,6 +165,12 @@ class MainWindow(QMainWindow):
         self._catalog = load_catalog()
         self._locale = "en"
         self._i18n_table = self._catalog["en"]
+        self._worker: ScmWorker | None = None
+        # Parented so it dies with the window. A bare QTimer.singleShot bound to
+        # a method would still fire after the window is gone, on a dead object.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._refresh_service_status)
 
         self._build_ui()
         self._wire()
@@ -191,15 +242,11 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self._build_hosts_panel(), 2)
         splitter.addWidget(top)
         splitter.addWidget(self._build_lists_panel())
+        splitter.addWidget(self._build_console_panel())
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
         root.addWidget(splitter, 1)
-
-        self.log_view = QTextEdit()
-        self.log_view.setObjectName("logView")
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(120)
-        root.addWidget(self.log_view)
 
         status = QStatusBar()
         self.setStatusBar(status)
@@ -334,6 +381,31 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         return box
 
+    def _build_console_panel(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        cap = QLabel("CONSOLE")
+        cap.setObjectName("sectionLabel")
+        cap.setProperty("i18n", "consoleSection")
+        self.clear_console_button = QPushButton("Clear")
+        self.clear_console_button.setObjectName("clearConsoleButton")
+        header.addWidget(cap)
+        header.addStretch(1)
+        header.addWidget(self.clear_console_button)
+        layout.addLayout(header)
+
+        self.console = QTextEdit()
+        self.console.setObjectName("consoleView")
+        self.console.setReadOnly(True)
+        self.console.setMinimumHeight(110)
+        self.console.setFont(QFont(CONSOLE_FONT_FAMILY))
+        layout.addWidget(self.console, 1)
+        return box
+
     def _wire(self) -> None:
         self.hosts_button.clicked.connect(self._on_open_hosts)
         self.language_button.clicked.connect(self._on_toggle_language)
@@ -350,6 +422,7 @@ class MainWindow(QMainWindow):
         self.backup_button.clicked.connect(self._on_backup)
         self.backup_all_button.clicked.connect(self._on_backup_all)
         self.save_button.clicked.connect(self._on_save_list)
+        self.clear_console_button.clicked.connect(self.console.clear)
 
     def _refresh_privilege_banner(self) -> None:
         elevated = is_process_elevated()
@@ -437,6 +510,53 @@ class MainWindow(QMainWindow):
             self._log(result.error or "Relaunch failed", error=True)
             QMessageBox.warning(self, PROJECT_NAME, result.error or "Relaunch failed")
 
+    def _service_buttons(self) -> tuple[QPushButton, ...]:
+        return (
+            self.install_button,
+            self.start_button,
+            self.stop_button,
+            self.remove_button,
+            self.status_button,
+        )
+
+    def _run_scm(self, verb: str, action, reporter) -> None:
+        """Run ``action(emit_step)`` on a worker thread, streaming steps to the console."""
+        if self._worker is not None:
+            self._log(f"{verb} ignored: another service action is still running.", error=True)
+            return
+        self._console_header(verb)
+        for button in self._service_buttons():
+            button.setEnabled(False)
+        worker = ScmWorker(action, self)
+        self._worker = worker
+        worker.step.connect(self._console_step)
+        worker.done.connect(lambda outcome: self._finish_scm(verb, reporter, outcome))
+        worker.finished.connect(self._release_worker)
+        worker.start()
+
+    def _finish_scm(self, verb: str, reporter, outcome) -> None:
+        """``done`` carries the result; the thread is still unwinding at this point."""
+        for button in self._service_buttons():
+            button.setEnabled(True)
+        if isinstance(outcome, Exception):
+            message = f"{verb} failed: {outcome}"
+            self._log(message, error=True)
+            QMessageBox.warning(self, PROJECT_NAME, message)
+            return
+        reporter(outcome)
+
+    def _release_worker(self) -> None:
+        """Drop the worker only once the thread has actually terminated.
+
+        Releasing it on ``done`` would leave a live QThread reachable only as a
+        child of this window; destroying the window around it aborts the process.
+        """
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.wait()
+            worker.deleteLater()
+
     def _on_install(self) -> None:
         parsed = self._current_parsed()
         if parsed is None:
@@ -446,35 +566,72 @@ class MainWindow(QMainWindow):
             self._log(f"winws.exe is missing: {parsed.image}", error=True)
             QMessageBox.warning(self, PROJECT_NAME, f"winws.exe is missing:\n{parsed.image}")
             return
-        result = install_service(parsed.image, parsed.args_line, allow_live=True)
+        stem = strategy_stem(parsed.name)
+        image, args = parsed.image, parsed.args_line
+
+        def action(emit_step):
+            return install_service(image, args, allow_live=True, on_step=emit_step)
+
+        self._run_scm(
+            f"Install Service — {parsed.name}",
+            action,
+            lambda result: self._after_install(stem, result),
+        )
+
+    def _after_install(self, stem: str, result: ScmOpResult) -> None:
+        # service.bat:362 records the strategy name after sc start.
         if result.ok:
-            ident = persist_installed_strategy(strategy_stem(parsed.name), allow_live=True)
-            if ident.ok:
-                self._log(f'Recorded strategy "{ident.plan.data}" as {ident.plan.value_name}')
-            else:
-                self._log(ident.error or "Failed to record installed strategy name", error=True)
+            ident = persist_installed_strategy(stem, allow_live=True)
+            self._console_step(
+                StepReport(
+                    kind="identity",
+                    command_line=(
+                        f'reg add "{ident.plan.key}" /v {ident.plan.value_name} '
+                        f'/t REG_SZ /d "{ident.plan.data}" /f'
+                    ),
+                    returncode=0 if ident.ok else 1,
+                    ok=ident.ok,
+                    note="" if ident.ok else (ident.error or "registry write failed"),
+                )
+            )
         self._report_scm("Install", result)
 
     def _on_start(self) -> None:
         parsed = self._current_parsed()
         image = parsed.image if parsed else str(winws_path(self.project_root)) if not self._root_error else ""
         args = parsed.args_line if parsed else ""
-        result = start_service(SERVICE_NAME, image=image, args=args, allow_live=True)
-        self._report_scm("Start", result)
+
+        def action(_emit_step):
+            return start_service(SERVICE_NAME, image=image, args=args, allow_live=True)
+
+        self._run_scm(
+            "Start",
+            action,
+            lambda result: self._report_scm("Start", result, render_steps=True),
+        )
 
     def _on_stop(self) -> None:
         parsed = self._current_parsed()
         image = parsed.image if parsed else ""
         args = parsed.args_line if parsed else ""
-        result = stop_service(SERVICE_NAME, image=image, args=args, allow_live=True)
-        self._report_scm("Stop", result)
+
+        def action(_emit_step):
+            return stop_service(SERVICE_NAME, image=image, args=args, allow_live=True)
+
+        self._run_scm(
+            "Stop",
+            action,
+            lambda result: self._report_scm("Stop", result, render_steps=True),
+        )
 
     def _on_query_status(self) -> None:
         self._refresh_service_status()
 
     def _on_remove(self) -> None:
-        result = remove_service(allow_live=True)
-        self._report_remove(result)
+        def action(emit_step):
+            return remove_service(allow_live=True, on_step=emit_step)
+
+        self._run_scm("Remove", action, self._report_remove)
 
     def _sync_game_filter_combo(self) -> None:
         current = load_game_filter(self.project_root)
@@ -503,6 +660,10 @@ class MainWindow(QMainWindow):
         self._log(
             f"Game Filter set to {gf.mode} (TCP={gf.tcp} UDP={gf.udp}). Restart zapret to apply."
         )
+
+    def _schedule_status_refresh(self, delay_ms: int) -> None:
+        """Re-query SCM shortly after a mutation, coalescing repeated requests."""
+        self._status_timer.start(delay_ms)
 
     def _refresh_service_status(self) -> None:
         try:
@@ -615,37 +776,96 @@ class MainWindow(QMainWindow):
         self._log(error, error=True)
         QMessageBox.warning(self, PROJECT_NAME, error)
 
-    def _report_scm(self, verb: str, result: ScmOpResult) -> None:
-        cmd = result.command
-        self._log(f"{verb}: {cmd.command_line}")
+    def _report_scm(self, verb: str, result: ScmOpResult, *, render_steps: bool = False) -> None:
+        if render_steps:
+            for report in result.steps:
+                self._console_step(report)
         if result.needs_elevation and not is_process_elevated():
-            self._log("Not elevated — UAC prompt requested for this SCM action.")
+            self._delegated(verb, result.command.command_line)
+            return
         if result.ok:
-            self._log(f"{verb} issued.")
-            QTimer.singleShot(400, self._refresh_service_status)
+            pid = f"  winws pid {result.pid}" if result.pid else ""
+            self._console_write(f"{verb} OK{pid}\n", CONSOLE_OK, bold=True)
+            self._schedule_status_refresh(200)
             return
         error = result.error or f"{verb} failed"
         self._log(error, error=True)
         QMessageBox.warning(self, PROJECT_NAME, error)
+        self._schedule_status_refresh(200)
 
     def _report_remove(self, result: RemoveResult) -> None:
-        self._log(f"Remove: {result.command_line}")
         if result.needs_elevation and not is_process_elevated():
-            self._log("Not elevated — UAC prompt requested for Remove.")
+            self._delegated("Remove", result.command_line)
+            return
         if result.ok:
-            self._log("Remove issued.")
-            QTimer.singleShot(400, self._refresh_service_status)
+            self._console_write("Remove OK\n", CONSOLE_OK, bold=True)
+            self._schedule_status_refresh(200)
             return
         error = result.error or "Remove failed"
         self._log(error, error=True)
         QMessageBox.warning(self, PROJECT_NAME, error)
+        self._schedule_status_refresh(200)
+
+    def _delegated(self, verb: str, command_line: str) -> None:
+        """A UAC-delegated action runs in a console this process cannot read.
+
+        Say so rather than claiming success, then re-query for the real state.
+        """
+        self._console_command(command_line)
+        self._console_write(
+            f"  [ ?? ] {verb} handed to an elevated console — result not visible here.\n",
+            CONSOLE_WARN,
+        )
+        self._schedule_status_refresh(1500)
+
+    def _console_write(self, text: str, color: str = CONSOLE_TEXT, *, bold: bool = False) -> None:
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        cursor.insertText(text, fmt)
+        self.console.setTextCursor(cursor)
+        self.console.ensureCursorVisible()
+
+    def _console_header(self, text: str) -> None:
+        self._console_write(f"\n=== {text} ===\n", CONSOLE_TEXT, bold=True)
+
+    def _console_command(self, line: str) -> None:
+        shown = line
+        if len(shown) > CONSOLE_COMMAND_LIMIT:
+            shown = f"{shown[:CONSOLE_COMMAND_LIMIT]}... (+{len(line) - CONSOLE_COMMAND_LIMIT} chars)"
+        self._console_write(f"> {shown}\n", CONSOLE_CMD)
+
+    def _console_step(self, report: StepReport) -> None:
+        self._console_command(report.command_line)
+        if report.ok:
+            tag, color = "[ OK ]", CONSOLE_OK
+        elif not report.fatal:
+            tag, color = "[WARN]", CONSOLE_WARN
+        else:
+            tag, color = "[FAIL]", CONSOLE_FAIL
+        head = report.note or (f"exit {report.returncode}" if report.returncode else "")
+        self._console_write(f"  {tag} ", color)
+        self._console_write(f"{head}\n" if head else "\n", CONSOLE_TEXT if report.ok else color)
+        for raw in report.detail.splitlines():
+            line = raw.strip()
+            if line:
+                self._console_write(f"         {line}\n", CONSOLE_MUTED)
 
     def _log(self, message: str, *, error: bool = False) -> None:
         prefix = "ERR" if error else "INF"
-        self.log_view.append(f"[{prefix}] {message}")
-        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self._console_write(f"[{prefix}] {message}\n", CONSOLE_FAIL if error else CONSOLE_MUTED)
         if error:
             self.statusBar().showMessage(message, 8000)
+
+    def closeEvent(self, event) -> None:
+        # Tearing down a QThread mid-sc.exe aborts the process; let it finish.
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            worker.wait(15000)
+        super().closeEvent(event)
 
 
 def _load_windows_fonts() -> None:
@@ -655,6 +875,9 @@ def _load_windows_fonts() -> None:
     for filename in (
         "tahoma.ttf",
         "tahomabd.ttf",
+        # The console pane opts out of Tahoma, so its family needs registering too.
+        "consola.ttf",
+        "consolab.ttf",
     ):
         path = fonts_dir / filename
         if path.is_file():

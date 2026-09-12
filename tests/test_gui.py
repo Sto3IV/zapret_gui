@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from zapret_gui.app import (
@@ -13,7 +14,17 @@ from zapret_gui.lists_io import read_list
 from zapret_gui.lists_io import write_list as shipped_write_list
 from zapret_gui.privileges import HostsLaunchPlan, HostsLaunchResult
 from zapret_gui.identity import IdentityResult, RegistryWrite
-from zapret_gui.services import RemoveResult, ScmCommand, ScmOpResult, ServiceStatus
+from zapret_gui.services import RemoveResult, ScmCommand, ScmOpResult, ServiceStatus, StepReport
+
+
+def _click_and_settle(qapp, window, button, timeout_s: float = 10.0) -> None:
+    """Click a service button and pump the loop until its worker thread reports back."""
+    button.click()
+    deadline = time.monotonic() + timeout_s
+    while window._worker is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+    qapp.processEvents()
+    assert window._worker is None, f"{button.objectName()} worker did not finish"
 
 
 def test_gui_source_binds_shipped_functions() -> None:
@@ -143,16 +154,122 @@ def test_main_window_constructs_and_wires_controls(qapp, project_root: Path, mon
             return RemoveResult(ok=True, steps=(), executed=True)
 
         monkeypatch.setattr("zapret_gui.app.remove_service", fake_remove)
-        window.install_button.click()
-        window.start_button.click()
-        window.stop_button.click()
+        _click_and_settle(qapp, window, window.install_button)
+        _click_and_settle(qapp, window, window.start_button)
+        _click_and_settle(qapp, window, window.stop_button)
         window.status_button.click()
-        window.remove_button.click()
+        _click_and_settle(qapp, window, window.remove_button)
         assert "install" in scm_calls
         assert "start" in scm_calls
         assert "stop" in scm_calls
         assert removed == ["remove"]
         assert persisted
+        # Every service action must leave a trace in the console pane.
+        console = window.console.toPlainText()
+        for verb in ("Install Service", "Start", "Stop", "Remove"):
+            assert verb in console
+    finally:
+        window.close()
+
+
+def test_install_streams_every_step_into_the_console(qapp, project_root: Path, monkeypatch) -> None:
+    """The console is the 'service.bat window' — each sc step must show up in it."""
+    steps = (
+        StepReport("tcp", "netsh.exe interface tcp show global", 0, note="timestamps already enabled", fatal=False),
+        StepReport("stop", "sc.exe stop zapret", 1062, stderr="The service has not been started.", ok=True),
+        StepReport("delete", "sc.exe delete zapret", 0, stdout="[SC] DeleteService SUCCESS"),
+        StepReport("create", "sc.exe create zapret binPath= ...", 0, stdout="[SC] CreateService SUCCESS"),
+        StepReport("describe", 'sc.exe description zapret "Zapret DPI bypass software"', 0, fatal=False),
+        StepReport("start", "sc.exe start zapret", 0, stdout="STATE : 2  START_PENDING"),
+        StepReport("verify", "sc.exe queryex zapret", 0, note="RUNNING  pid 24188"),
+    )
+
+    def fake_install(image, args, **kwargs):
+        emit = kwargs.get("on_step")
+        for report in steps:
+            if emit is not None:
+                emit(report)
+        argv = ("sc.exe", "create", "zapret")
+        return ScmOpResult(
+            ok=True,
+            command=ScmCommand("install", argv, " ".join(argv), "zapret", image, args),
+            executed=True,
+            steps=steps,
+            verified=True,
+            pid=24188,
+        )
+
+    monkeypatch.setattr("zapret_gui.app.install_service", fake_install)
+    monkeypatch.setattr(
+        "zapret_gui.app.persist_installed_strategy",
+        lambda stem, **_k: IdentityResult(
+            ok=True,
+            plan=RegistryWrite(
+                key=r"HKLM\SYSTEM\CurrentControlSet\Services\zapret",
+                value_name="zapret-discord-youtube",
+                data=stem,
+            ),
+            executed=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "zapret_gui.app.query_service_status",
+        lambda *a, **k: ServiceStatus(state="running", service_name="zapret", message="running"),
+    )
+
+    window = MainWindow(project_root=project_root)
+    try:
+        _click_and_settle(qapp, window, window.install_button)
+        console = window.console.toPlainText()
+        for line in (
+            "netsh.exe interface tcp show global",
+            "sc.exe stop zapret",
+            "sc.exe delete zapret",
+            "sc.exe create zapret",
+            "sc.exe description zapret",
+            "sc.exe start zapret",
+            "sc.exe queryex zapret",
+        ):
+            assert line in console, f"console is missing {line!r}"
+        assert "[SC] CreateService SUCCESS" in console
+        assert "RUNNING  pid 24188" in console
+        assert "zapret-discord-youtube" in console
+        assert "Install OK" in console
+        assert "winws pid 24188" in console
+
+        window.clear_console_button.click()
+        qapp.processEvents()
+        assert window.console.toPlainText().strip() == ""
+    finally:
+        window.close()
+
+
+def test_unelevated_action_does_not_claim_success(qapp, project_root: Path, monkeypatch) -> None:
+    """ShellExecute > 32 only means cmd.exe launched; the console must say so."""
+    argv = ("sc.exe", "start", "zapret")
+    command = ScmCommand("start", argv, " ".join(argv), "zapret")
+    monkeypatch.setattr(
+        "zapret_gui.app.start_service",
+        lambda *a, **k: ScmOpResult(
+            ok=True,
+            command=command,
+            executed=True,
+            needs_elevation=True,
+            verified=False,
+        ),
+    )
+    monkeypatch.setattr("zapret_gui.app.is_process_elevated", lambda: False)
+    monkeypatch.setattr(
+        "zapret_gui.app.query_service_status",
+        lambda *a, **k: ServiceStatus(state="stopped", service_name="zapret", message="stopped"),
+    )
+
+    window = MainWindow(project_root=project_root)
+    try:
+        _click_and_settle(qapp, window, window.start_button)
+        console = window.console.toPlainText()
+        assert "not visible here" in console
+        assert "Start OK" not in console
     finally:
         window.close()
 

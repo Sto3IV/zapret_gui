@@ -23,7 +23,23 @@ REQUIRED_BUTTONS = (
     "hostsButton",
     "relaunchAdminButton",
     "languageButton",
+    "clearConsoleButton",
 )
+
+REQUIRED_LABELS = (
+    "serviceSection",
+    "hostsSection",
+    "listsSection",
+    "consoleSection",
+)
+
+
+def test_lang_file_covers_section_labels() -> None:
+    catalog = load_catalog()
+    for locale in ("en", "ru"):
+        for key in REQUIRED_LABELS:
+            assert key in catalog[locale], f"{locale} missing {key}"
+            assert catalog[locale][key].strip()
 
 
 def test_lang_file_covers_all_gui_buttons() -> None:
@@ -125,5 +141,6 @@ def _attr(object_name: str) -> str:
         "hostsButton": "hosts_button",
         "relaunchAdminButton": "relaunch_button",
         "languageButton": "language_button",
+        "clearConsoleButton": "clear_console_button",
     }
     return mapping.get(object_name, object_name)

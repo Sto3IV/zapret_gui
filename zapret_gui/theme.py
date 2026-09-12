@@ -20,16 +20,22 @@ PALETTE: dict[str, str] = {
     "accent_emphasis": "#409eff",
     "danger": "#ff6a69",
     "success": "#26cd4d",
+    # Primer DHC attention-fg. The console warn colour, matching service.bat's
+    # :PrintYellow for advisory steps that failed without aborting the install.
+    "attention": "#f0b72f",
 }
 
 # Single GUI typeface. Every widget inherits this family.
 GUI_FONT_FAMILY = "Tahoma"
+# The console pane is the one place that needs column alignment, so it opts out.
+CONSOLE_FONT_FAMILY = "Consolas"
 
 
 def build_stylesheet(palette: Mapping[str, str] | None = None) -> str:
     """Interpolate the shipped QSS from Primer DHC tokens. Tests import this."""
     p = dict(PALETTE if palette is None else palette)
     family = GUI_FONT_FAMILY
+    mono = CONSOLE_FONT_FAMILY
     return f"""
 * {{
     font-family: "{family}";
@@ -151,6 +157,19 @@ QStatusBar {{
 }}
 QSplitter::handle {{
     background: {p["canvas_overlay"]};
+}}
+/* The `*` rule above sets Tahoma everywhere; an id selector outranks it. */
+QTextEdit#consoleView {{
+    background: {p["canvas_inset"]};
+    color: {p["fg"]};
+    border: 1px solid {p["border"]};
+    font-family: "{mono}", "Courier New", monospace;
+    font-size: 12px;
+}}
+QPushButton#clearConsoleButton {{
+    padding: 3px 10px;
+    min-height: 20px;
+    font-size: 11px;
 }}
 QScrollBar:vertical, QScrollBar:horizontal {{
     background: {p["canvas"]};

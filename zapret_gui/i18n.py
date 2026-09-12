@@ -28,6 +28,7 @@ BUTTON_OBJECT_NAMES: tuple[str, ...] = (
     "hostsButton",
     "relaunchAdminButton",
     "languageButton",
+    "clearConsoleButton",
 )
 
 def default_lang_file() -> Path:
