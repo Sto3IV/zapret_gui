@@ -82,6 +82,29 @@ def test_window_frame_is_1px_7zdark_edge() -> None:
     assert "#ffffff" not in PALETTE["window_edge"].lower()
 
 
+def test_status_line_states_are_styled() -> None:
+    qss = STYLESHEET.lower()
+    for state, token in (
+        ("running", "success"),
+        ("pending", "attention"),
+        ("stopped", "danger"),
+        ("not_installed", "fg_muted"),
+        ("error", "danger"),
+    ):
+        selector = f'qlabel#servicestatuslabel[state="{state}"]'
+        at = qss.find(selector)
+        assert at != -1, f"missing {selector}"
+        block = qss[at : qss.find("}", at) + 1]
+        assert PALETTE[token].lower() in block, f"{selector} should use {token}"
+
+
+def test_retired_buttons_have_no_styles_and_the_hint_does() -> None:
+    qss = STYLESHEET.lower()
+    assert "stopbutton" not in qss
+    assert "qlabel#testshint" in qss
+    assert "qpushbutton#removebutton" in qss
+
+
 def test_app_uses_theme_stylesheet() -> None:
     from zapret_gui import app as app_mod
     from zapret_gui import theme as theme_mod

@@ -3,18 +3,62 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+from PySide6.QtWidgets import QMessageBox, QPushButton
+
 from zapret_gui.app import (
     REQUIRED_OBJECT_NAMES,
     MainWindow,
     missing_required_widgets,
     run_smoke,
 )
+from zapret_gui.diagnostics import DiagLine
+from zapret_gui.identity import IdentityResult, RegistryWrite
 from zapret_gui.lists_io import backup_list as shipped_backup_list
 from zapret_gui.lists_io import read_list
 from zapret_gui.lists_io import write_list as shipped_write_list
 from zapret_gui.privileges import HostsLaunchPlan, HostsLaunchResult
-from zapret_gui.identity import IdentityResult, RegistryWrite
-from zapret_gui.services import RemoveResult, ScmCommand, ScmOpResult, ServiceStatus, StepReport
+from zapret_gui.services import RemoveResult, ScmCommand, ScmOpResult, ServiceSnapshot, StepReport
+from zapret_gui.tools import POWERSHELL_REQUIRED, TESTS_STARTING, ToolLaunch, ToolLaunchResult
+
+TESTS_HINT_EN = "Don't know what strategy to use? Run tests and it will choose the best strategy for you!"
+
+
+def _snapshot(token: str = "NOT_INSTALLED", *, strategy: str | None = None, image: str = "") -> ServiceSnapshot:
+    return ServiceSnapshot(service_name="zapret", token=token, image=image, strategy=strategy)
+
+
+@pytest.fixture(autouse=True)
+def _quiet_scm(monkeypatch):
+    """GUI tests never read the live service; each test states the SCM it expects."""
+    monkeypatch.setattr("zapret_gui.app.query_service_snapshot", lambda *_a, **_k: _snapshot())
+
+
+def _identity(stem: str) -> IdentityResult:
+    return IdentityResult(
+        ok=True,
+        plan=RegistryWrite(
+            key=r"HKLM\SYSTEM\CurrentControlSet\Services\zapret",
+            value_name="zapret-discord-youtube",
+            data=stem,
+        ),
+        executed=True,
+    )
+
+
+def _fake_launch(calls: list):
+    def launch(root, *, elevated, **_kwargs) -> ToolLaunchResult:
+        calls.append((Path(root), elevated))
+        plan = ToolLaunch(
+            file="powershell.exe",
+            params="-NoProfile -ExecutionPolicy Bypass -File x",
+            verb="open" if elevated else "runas",
+            directory=str(root),
+            script=Path(root) / "utils" / "test zapret.ps1",
+        )
+        return ToolLaunchResult(ok=True, plan=plan, native_code=42)
+
+    return launch
 
 
 def _click_and_settle(qapp, window, button, timeout_s: float = 10.0) -> None:
@@ -36,10 +80,14 @@ def test_gui_source_binds_shipped_functions() -> None:
     for fn in (
         "launch_hosts_notepad",
         "install_service",
-        "start_service",
-        "stop_service",
-        "query_service_status",
         "remove_service",
+        "query_service_snapshot",
+        "run_diagnostics",
+        "default_probes",
+        "launch_tests",
+        "powershell_supported",
+        "newest_result_since",
+        "find_best_strategy_line",
         "save_game_filter",
         "persist_installed_strategy",
         "backup_list",
@@ -49,24 +97,28 @@ def test_gui_source_binds_shipped_functions() -> None:
         "parse_strategy",
     ):
         assert fn in source, f"GUI does not reference shipped function {fn}"
+    for gone in ("startButton", "stopButton", "statusButton", "start_service", "stop_service"):
+        assert gone not in source, f"{gone} should be gone from the GUI"
     # List editor path must not spawn notepad; hosts path is allowed to.
     editor_region = source.split("def _on_save_list")[1].split("def _report_hosts")[0]
     assert "notepad" not in editor_region.lower()
     assert "write_list" in source.split("def _on_save_list")[1].split("def _report_hosts")[0]
 
 
-def test_main_window_constructs_and_wires_controls(qapp, project_root: Path, monkeypatch) -> None:
+def test_main_window_constructs_and_wires_controls(qapp, project_root: Path, tmp_path: Path, monkeypatch) -> None:
     window = MainWindow(project_root=project_root)
+    window.results_dir = tmp_path
     try:
         missing = missing_required_widgets(window)
         assert missing == [], f"missing controls: {missing}"
         assert window.hosts_button.objectName() == "hostsButton"
         assert window.strategy_combo.objectName() == "strategyCombo"
         assert window.install_button.objectName() == "installButton"
-        assert window.start_button.objectName() == "startButton"
-        assert window.stop_button.objectName() == "stopButton"
-        assert window.status_button.objectName() == "statusButton"
         assert window.remove_button.objectName() == "removeButton"
+        assert window.tests_button.objectName() == "testsButton"
+        assert window.diagnostics_button.objectName() == "diagnosticsButton"
+        for gone in ("startButton", "stopButton", "statusButton"):
+            assert window.findChild(QPushButton, gone) is None
         assert window.game_filter_combo.objectName() == "gameFilterCombo"
         assert window.game_filter_combo.count() == 4
         assert window.list_editor.objectName() == "listEditor"
@@ -99,75 +151,115 @@ def test_main_window_constructs_and_wires_controls(qapp, project_root: Path, mon
 
         scm_calls: list[str] = []
 
-        def _ok_result(action: str, image: str = "", args: str = "") -> ScmOpResult:
-            argv = ("sc.exe", action if action != "install" else "create", "zapret")
-            cmd = ScmCommand(
-                action=action,  # type: ignore[arg-type]
-                argv=argv,
-                command_line=" ".join(argv),
-                service_name="zapret",
-                image=image,
-                args=args,
-            )
-            scm_calls.append(action)
-            return ScmOpResult(ok=True, command=cmd, executed=True)
+        def fake_install(image, args, **_kwargs) -> ScmOpResult:
+            argv = ("sc.exe", "create", "zapret")
+            scm_calls.append("install")
+            return ScmOpResult(ok=True, command=ScmCommand("install", argv, " ".join(argv), "zapret", image, args), executed=True)
 
-        monkeypatch.setattr(
-            "zapret_gui.app.install_service",
-            lambda image, args, **k: _ok_result("install", image, args),
-        )
-        monkeypatch.setattr(
-            "zapret_gui.app.start_service",
-            lambda *a, **k: _ok_result("start"),
-        )
-        monkeypatch.setattr(
-            "zapret_gui.app.stop_service",
-            lambda *a, **k: _ok_result("stop"),
-        )
-        monkeypatch.setattr(
-            "zapret_gui.app.query_service_status",
-            lambda *a, **k: ServiceStatus(
-                state="not_installed",
-                service_name="zapret",
-                message="not installed",
-            ),
-        )
+        monkeypatch.setattr("zapret_gui.app.install_service", fake_install)
         persisted: list[str] = []
-
-        def fake_persist(stem, **_k):
-            persisted.append(stem)
-            return IdentityResult(
-                ok=True,
-                plan=RegistryWrite(
-                    key=r"HKLM\SYSTEM\CurrentControlSet\Services\zapret",
-                    value_name="zapret-discord-youtube",
-                    data=stem,
-                ),
-                executed=True,
-            )
-
-        monkeypatch.setattr("zapret_gui.app.persist_installed_strategy", fake_persist)
+        monkeypatch.setattr(
+            "zapret_gui.app.persist_installed_strategy",
+            lambda stem, **_k: persisted.append(stem) or _identity(stem),
+        )
         removed: list[str] = []
 
-        def fake_remove(**_k) -> RemoveResult:
+        def fake_remove(**_kwargs) -> RemoveResult:
             removed.append("remove")
             return RemoveResult(ok=True, steps=(), executed=True)
 
         monkeypatch.setattr("zapret_gui.app.remove_service", fake_remove)
+        launches: list = []
+        monkeypatch.setattr("zapret_gui.app.powershell_supported", lambda *a, **k: True)
+        monkeypatch.setattr("zapret_gui.app.launch_tests", _fake_launch(launches))
+        diagnosed: list[Path] = []
+
+        def fake_diagnostics(root, *, probes, emit, ask):
+            diagnosed.append(Path(root))
+            emit(DiagLine("ok", "Base Filtering Engine check passed"))
+
+        monkeypatch.setattr("zapret_gui.app.run_diagnostics", fake_diagnostics)
+        monkeypatch.setattr("zapret_gui.app.default_probes", lambda: object())
+
         _click_and_settle(qapp, window, window.install_button)
-        _click_and_settle(qapp, window, window.start_button)
-        _click_and_settle(qapp, window, window.stop_button)
-        window.status_button.click()
         _click_and_settle(qapp, window, window.remove_button)
-        assert "install" in scm_calls
-        assert "start" in scm_calls
-        assert "stop" in scm_calls
-        assert removed == ["remove"]
+        _click_and_settle(qapp, window, window.tests_button)
+        _click_and_settle(qapp, window, window.diagnostics_button)
+
+        assert scm_calls == ["install"]
         assert persisted
-        # Every service action must leave a trace in the console pane.
+        assert removed == ["remove"]
+        assert launches == [(project_root, launches[0][1])]
+        assert diagnosed == [project_root]
         console = window.console.toPlainText()
-        for verb in ("Install Service", "Start", "Stop", "Remove"):
-            assert verb in console
+        for header in ("=== Install Service", "=== Remove ===", "=== Tests ===", "=== Diagnostics ==="):
+            assert header in console
+        assert "Base Filtering Engine check passed" in console
+        assert "Diagnostics finished" in console
+    finally:
+        window.close()
+
+
+def test_service_buttons_sit_two_per_row(qapp, project_root: Path) -> None:
+    window = MainWindow(project_root=project_root)
+    try:
+        grid = window.service_buttons_grid
+        assert grid.rowCount() == 2 and grid.columnCount() == 2
+        cells = [
+            [grid.itemAtPosition(row, column).widget().objectName() for column in range(2)]
+            for row in range(2)
+        ]
+        assert cells == [["installButton", "removeButton"], ["testsButton", "diagnosticsButton"]]
+        assert window.tests_hint.text() == TESTS_HINT_EN
+        assert window.tests_button.toolTip() == TESTS_HINT_EN
+    finally:
+        window.close()
+
+
+def test_status_line_sits_beside_the_title_and_tracks_scm(qapp, project_root: Path, monkeypatch) -> None:
+    current = {"snapshot": _snapshot("RUNNING", strategy="general (ALT2)", image=str(project_root / "bin" / "winws.exe"))}
+    monkeypatch.setattr("zapret_gui.app.query_service_snapshot", lambda *_a, **_k: current["snapshot"])
+    window = MainWindow(project_root=project_root)
+    try:
+        label = window.service_status_label
+        title = next(child for child in window.findChildren(type(label)) if child.objectName() == "titleLabel")
+        assert label.parentWidget() is title.parentWidget(), "status must share the title's row"
+        assert label.text() == "● RUNNING  ·  general (ALT2)"
+        assert label.property("state") == "running"
+
+        current["snapshot"] = _snapshot("STOPPED", strategy="general (ALT2)", image=r"E:\.ZAPRET\bin\winws.exe")
+        window._poll_service_status()
+        assert label.text() == "● STOPPED  ·  general (ALT2)  ·  E:\\.ZAPRET"
+        assert label.property("state") == "stopped"
+
+        window._poll_service_status()
+        console = window.console.toPlainText()
+        assert console.count("running → stopped") == 1, "log the change once, not every poll"
+
+        current["snapshot"] = _snapshot("NOT_INSTALLED")
+        window._poll_service_status()
+        assert label.text() == "● NOT INSTALLED"
+        assert label.property("state") == "not_installed"
+    finally:
+        window.close()
+
+
+def test_status_poll_pauses_while_a_worker_runs(qapp, project_root: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "zapret_gui.app.remove_service",
+        lambda **_k: RemoveResult(ok=True, steps=(), executed=True),
+    )
+    window = MainWindow(project_root=project_root)
+    try:
+        assert window._status_poll.isActive()
+        window.remove_button.click()
+        assert not window._status_poll.isActive(), "an SCM handle across sc delete reintroduces 1072"
+        deadline = time.monotonic() + 10
+        while window._worker is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+        qapp.processEvents()
+        assert window._worker is None
+        assert window._status_poll.isActive()
     finally:
         window.close()
 
@@ -176,8 +268,8 @@ def test_install_streams_every_step_into_the_console(qapp, project_root: Path, m
     """The console is the 'service.bat window' — each sc step must show up in it."""
     steps = (
         StepReport("tcp", "netsh.exe interface tcp show global", 0, note="timestamps already enabled", fatal=False),
-        StepReport("stop", "sc.exe stop zapret", 1062, stderr="The service has not been started.", ok=True),
-        StepReport("delete", "sc.exe delete zapret", 0, stdout="[SC] DeleteService SUCCESS"),
+        StepReport("stop", "sc.exe stop zapret", 0, note="stopped"),
+        StepReport("delete", "sc.exe delete zapret", 0, stdout="[SC] DeleteService SUCCESS", note="removed"),
         StepReport("create", "sc.exe create zapret binPath= ...", 0, stdout="[SC] CreateService SUCCESS"),
         StepReport("describe", 'sc.exe description zapret "Zapret DPI bypass software"', 0, fatal=False),
         StepReport("start", "sc.exe start zapret", 0, stdout="STATE : 2  START_PENDING"),
@@ -200,22 +292,7 @@ def test_install_streams_every_step_into_the_console(qapp, project_root: Path, m
         )
 
     monkeypatch.setattr("zapret_gui.app.install_service", fake_install)
-    monkeypatch.setattr(
-        "zapret_gui.app.persist_installed_strategy",
-        lambda stem, **_k: IdentityResult(
-            ok=True,
-            plan=RegistryWrite(
-                key=r"HKLM\SYSTEM\CurrentControlSet\Services\zapret",
-                value_name="zapret-discord-youtube",
-                data=stem,
-            ),
-            executed=True,
-        ),
-    )
-    monkeypatch.setattr(
-        "zapret_gui.app.query_service_status",
-        lambda *a, **k: ServiceStatus(state="running", service_name="zapret", message="running"),
-    )
+    monkeypatch.setattr("zapret_gui.app.persist_installed_strategy", lambda stem, **_k: _identity(stem))
 
     window = MainWindow(project_root=project_root)
     try:
@@ -244,32 +321,129 @@ def test_install_streams_every_step_into_the_console(qapp, project_root: Path, m
         window.close()
 
 
-def test_unelevated_action_does_not_claim_success(qapp, project_root: Path, monkeypatch) -> None:
-    """ShellExecute > 32 only means cmd.exe launched; the console must say so."""
-    argv = ("sc.exe", "start", "zapret")
-    command = ScmCommand("start", argv, " ".join(argv), "zapret")
+def test_unelevated_install_does_not_claim_success_or_stamp_the_registry(
+    qapp, project_root: Path, monkeypatch
+) -> None:
+    """ShellExecute > 32 only means cmd.exe launched; nothing was observed."""
+    argv = ("sc.exe", "create", "zapret")
     monkeypatch.setattr(
-        "zapret_gui.app.start_service",
-        lambda *a, **k: ScmOpResult(
+        "zapret_gui.app.install_service",
+        lambda image, args, **_k: ScmOpResult(
             ok=True,
-            command=command,
+            command=ScmCommand("install", argv, " ".join(argv), "zapret", image, args),
             executed=True,
             needs_elevation=True,
             verified=False,
         ),
     )
     monkeypatch.setattr("zapret_gui.app.is_process_elevated", lambda: False)
+    stamped: list[str] = []
     monkeypatch.setattr(
-        "zapret_gui.app.query_service_status",
-        lambda *a, **k: ServiceStatus(state="stopped", service_name="zapret", message="stopped"),
+        "zapret_gui.app.persist_installed_strategy",
+        lambda stem, **_k: stamped.append(stem) or _identity(stem),
     )
 
     window = MainWindow(project_root=project_root)
     try:
-        _click_and_settle(qapp, window, window.start_button)
+        _click_and_settle(qapp, window, window.install_button)
         console = window.console.toPlainText()
         assert "not visible here" in console
-        assert "Start OK" not in console
+        assert "Install OK" not in console
+        assert stamped == [], "an unobserved install must not write the strategy name"
+    finally:
+        window.close()
+
+
+def test_tests_button_launches_like_service_bat_and_preselects_the_winner(
+    qapp, project_root: Path, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "zapret_gui.app.query_service_snapshot",
+        lambda *_a, **_k: _snapshot("RUNNING", strategy="general (ALT2)", image=r"E:\.ZAPRET\bin\winws.exe"),
+    )
+    launches: list = []
+    monkeypatch.setattr("zapret_gui.app.powershell_supported", lambda *a, **k: True)
+    monkeypatch.setattr("zapret_gui.app.launch_tests", _fake_launch(launches))
+
+    window = MainWindow(project_root=project_root)
+    window.results_dir = tmp_path
+    try:
+        window.strategy_combo.setCurrentIndex(window.strategy_combo.findText("general.bat"))
+        _click_and_settle(qapp, window, window.tests_button)
+        console = window.console.toPlainText()
+        assert TESTS_STARTING in console
+        assert "the tests refuse to run until you press Remove" in console
+        assert len(launches) == 1 and launches[0][0] == project_root
+        assert window._results_since is not None, "the results folder must be watched"
+
+        results = tmp_path / "test_results_2026-09-13_10-42-07.txt"
+        results.write_bytes(
+            (
+                "\ufeff=== ANALYTICS ===\r\n"
+                "general (ALT11).bat : OK:  96, FAIL:  10, UNSUP:   0, BLOCKED:   0\r\n"
+                "Best strategy: general (ALT11).bat\r\n"
+            ).encode("utf-8")
+        )
+        deadline = time.monotonic() + 8
+        while window.strategy_combo.currentText() != "general (ALT11).bat" and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert window.strategy_combo.currentText() == "general (ALT11).bat"
+        assert "Tests picked general (ALT11).bat" in window.console.toPlainText()
+        assert window._results_since is None, "one result disarms the watch"
+    finally:
+        window.close()
+
+
+def test_tests_button_refuses_without_powershell_3(qapp, project_root: Path, monkeypatch) -> None:
+    launches: list = []
+    monkeypatch.setattr("zapret_gui.app.powershell_supported", lambda *a, **k: False)
+    monkeypatch.setattr("zapret_gui.app.launch_tests", _fake_launch(launches))
+    window = MainWindow(project_root=project_root)
+    try:
+        _click_and_settle(qapp, window, window.tests_button)
+        console = window.console.toPlainText()
+        for line in POWERSHELL_REQUIRED:
+            assert line in console
+        assert TESTS_STARTING not in console
+        assert launches == []
+    finally:
+        window.close()
+
+
+def test_diagnostics_prompt_reaches_a_dialog_and_back(qapp, project_root: Path, monkeypatch) -> None:
+    answers: list[bool] = []
+
+    def fake_diagnostics(root, *, probes, emit, ask):
+        emit(DiagLine("ok", "Proxy check passed"))
+        emit(DiagLine("blank"))
+        emit(DiagLine("fail", "[X] Adguard process found. Adguard may cause problems with Discord"))
+        answers.append(ask("diagDiscordPrompt", True))
+
+    asked: list = []
+
+    def fake_question(*args, **_kwargs):
+        asked.append(args)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr("zapret_gui.app.run_diagnostics", fake_diagnostics)
+    monkeypatch.setattr("zapret_gui.app.default_probes", lambda: object())
+    monkeypatch.setattr("zapret_gui.app.QMessageBox.question", fake_question)
+
+    window = MainWindow(project_root=project_root)
+    try:
+        _click_and_settle(qapp, window, window.diagnostics_button)
+        assert answers == [False]
+        assert len(asked) == 1
+        _parent, _title, text, _buttons, preferred = asked[0]
+        assert text == "Do you want to clear the Discord cache (Stable, PTB, Canary, Development)?"
+        # service.bat's default for this prompt is Y.
+        assert preferred == QMessageBox.StandardButton.Yes
+        console = window.console.toPlainText()
+        assert "Proxy check passed" in console
+        assert "[X] Adguard process found" in console
+        assert "(Y/N) (default: Y) N" in console
+        assert "Diagnostics finished" in console
     finally:
         window.close()
 

@@ -12,20 +12,24 @@ type, so the explicit ``sc start`` is what actually brings winws up.
 
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Literal
 
-from zapret_gui import SERVICE_NAME
+from zapret_gui import SERVICE_NAME, STRATEGY_VALUE_NAME
 from zapret_gui.identity import read_installed_strategy
 from zapret_gui.privileges import is_process_elevated, shell_execute
 
 ServiceState = Literal["running", "stopped", "not_installed", "error"]
 ScmAction = Literal["install", "start", "stop", "delete", "status", "describe", "tcp"]
-StepKind = Literal["tcp", "stop", "delete", "create", "describe", "start", "verify", "identity"]
+StepKind = Literal[
+    "tcp", "stop", "delete", "create", "describe", "start", "verify", "identity", "taskkill"
+]
 
 # Windows ``sc`` / OpenService / StartService
 ERROR_FILE_NOT_FOUND = 2
@@ -49,6 +53,11 @@ _REPLACE_DELETE_OK = frozenset({0, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_M
 _START_OK = frozenset({0, ERROR_SERVICE_ALREADY_RUNNING})
 _TASKKILL_OK = frozenset({0, 1, ERROR_TASKKILL_NOT_FOUND})
 
+# `net stop` blocks until STOPPED; `sc stop` returns at STOP_PENDING. These bound
+# the waits that stand in for that blocking.
+STOP_SETTLE_S = 20.0
+DELETE_SETTLE_S = 10.0
+
 # service.bat:357
 SERVICE_DESCRIPTION = "Zapret DPI bypass software"
 
@@ -64,7 +73,10 @@ SC_ERRORS: dict[int, str] = {
     ERROR_SERVICE_DISABLED: "the service is disabled",
     ERROR_SERVICE_DOES_NOT_EXIST: "the service is not installed",
     ERROR_SERVICE_NOT_ACTIVE: "the service has not been started",
-    ERROR_SERVICE_MARKED_FOR_DELETE: "the service is marked for deletion - reboot and retry",
+    ERROR_SERVICE_MARKED_FOR_DELETE: (
+        "the service is marked for deletion - it disappears once it has stopped "
+        "and no process holds a handle to it"
+    ),
     ERROR_SERVICE_EXISTS: "the service already exists",
     ERROR_SERVICE_DEPENDENCY_DELETED: "a service dependency was deleted",
     ERROR_SERVICE_NEVER_STARTED: "the service has never been started",
@@ -125,6 +137,45 @@ class ServiceStatus:
     strategy_name: str | None = None
 
 
+_SNAPSHOT_STATES = {
+    "RUNNING": "running",
+    "START_PENDING": "pending",
+    "CONTINUE_PENDING": "pending",
+    "STOP_PENDING": "pending",
+    "PAUSE_PENDING": "pending",
+    "STOPPED": "stopped",
+    "PAUSED": "stopped",
+    "NOT_INSTALLED": "not_installed",
+}
+_SCM_STATE_TOKENS = {
+    1: "STOPPED",
+    2: "START_PENDING",
+    3: "STOP_PENDING",
+    4: "RUNNING",
+    5: "CONTINUE_PENDING",
+    6: "PAUSE_PENDING",
+    7: "PAUSED",
+}
+
+
+@dataclass(frozen=True)
+class ServiceSnapshot:
+    """What the always-on status line shows, read straight from the SCM."""
+
+    service_name: str
+    token: str  # RUNNING / START_PENDING / ... / NOT_INSTALLED / ERROR
+    pid: int | None = None
+    exit_code: int = 0
+    image: str = ""
+    strategy: str | None = None
+    error: str = ""
+
+    @property
+    def state(self) -> str:
+        """running / pending / stopped / not_installed / error."""
+        return _SNAPSHOT_STATES.get(self.token, "error")
+
+
 @dataclass(frozen=True)
 class StepReport:
     """One executed step of a multi-step SCM action, as the console renders it."""
@@ -183,6 +234,7 @@ class ScmOpResult:
 
 ScmRunner = Callable[[ScmCommand], CompletedScm]
 StepObserver = Callable[[StepReport], None]
+Waiter = Callable[..., ServiceWait]
 
 
 class ScmError(RuntimeError):
@@ -353,6 +405,155 @@ def exit_code_hint(raw: str) -> str:
     if code == 0:
         return ""
     return f"WIN32_EXIT_CODE {code} - {describe_sc_error(code)}"
+
+
+def image_from_image_path(image_path: str) -> str:
+    """The executable inside a service ImagePath: ``"C:\\x\\winws.exe" args`` → ``C:\\x\\winws.exe``."""
+    text = (image_path or "").strip()
+    if not text:
+        return ""
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        return text[1:end] if end > 0 else text[1:]
+    match = re.match(r"(.+?\.exe)(?:\s|$)", text, re.IGNORECASE)
+    return match.group(1) if match else text.split()[0]
+
+
+def image_install_root(image: str) -> str:
+    """``E:\\.ZAPRET\\bin\\winws.exe`` → ``E:\\.ZAPRET``: the tree a winws image belongs to."""
+    parent = PureWindowsPath(image).parent
+    return str(parent.parent if parent.name.lower() == "bin" else parent)
+
+
+def image_is_under(image: str, root: Path) -> bool:
+    """Case-insensitive, whole-component containment (``...-project-old`` is not ``...-project``)."""
+    image_parts = [part.lower() for part in PureWindowsPath(image).parts]
+    root_parts = [part.lower() for part in PureWindowsPath(str(root)).parts]
+    return bool(root_parts) and image_parts[: len(root_parts)] == root_parts
+
+
+def query_service_snapshot(service_name: str = SERVICE_NAME) -> ServiceSnapshot:
+    """Read the service state via QueryServiceStatusEx: ~0.1 ms and no process spawned.
+
+    Polling ``sc query`` instead costs ~35 ms and a process launch per read.
+    """
+    if sys.platform != "win32":
+        return ServiceSnapshot(service_name, "ERROR", error="the SCM is only available on Windows")
+    try:
+        token, pid, exit_code = _query_status_ex(service_name)
+    except OSError as exc:
+        return ServiceSnapshot(service_name, "ERROR", error=str(exc))
+    if token == "NOT_INSTALLED":
+        return ServiceSnapshot(service_name, token)
+    image, strategy = _read_service_registry(service_name)
+    return ServiceSnapshot(
+        service_name,
+        token,
+        pid=pid or None,
+        exit_code=exit_code,
+        image=image,
+        strategy=strategy,
+    )
+
+
+_SC_MANAGER_CONNECT = 0x0001
+_SERVICE_QUERY_STATUS = 0x0004
+_SC_STATUS_PROCESS_INFO = 0
+
+
+@functools.lru_cache(maxsize=1)
+def _scm_api():
+    import ctypes
+    from ctypes import wintypes
+
+    class ServiceStatusProcess(ctypes.Structure):
+        _fields_ = [
+            (name, wintypes.DWORD)
+            for name in (
+                "dwServiceType",
+                "dwCurrentState",
+                "dwControlsAccepted",
+                "dwWin32ExitCode",
+                "dwServiceSpecificExitCode",
+                "dwCheckPoint",
+                "dwWaitHint",
+                "dwProcessId",
+                "dwServiceFlags",
+            )
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenSCManagerW.restype = wintypes.HANDLE
+    advapi.OpenSCManagerW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    advapi.OpenServiceW.restype = wintypes.HANDLE
+    advapi.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD)
+    advapi.QueryServiceStatusEx.restype = wintypes.BOOL
+    advapi.QueryServiceStatusEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi.CloseServiceHandle.restype = wintypes.BOOL
+    advapi.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    return ctypes, wintypes, advapi, ServiceStatusProcess
+
+
+def _query_status_ex(service_name: str) -> tuple[str, int, int]:
+    ctypes, wintypes, advapi, ServiceStatusProcess = _scm_api()
+    manager = advapi.OpenSCManagerW(None, None, _SC_MANAGER_CONNECT)
+    if not manager:
+        code = ctypes.get_last_error()
+        raise OSError(code, f"OpenSCManager failed ({code})")
+    try:
+        handle = advapi.OpenServiceW(manager, service_name, _SERVICE_QUERY_STATUS)
+        if not handle:
+            code = ctypes.get_last_error()
+            if code == ERROR_SERVICE_DOES_NOT_EXIST:
+                return "NOT_INSTALLED", 0, 0
+            raise OSError(code, f"OpenService failed ({code})")
+        try:
+            status = ServiceStatusProcess()
+            needed = wintypes.DWORD()
+            if not advapi.QueryServiceStatusEx(
+                handle,
+                _SC_STATUS_PROCESS_INFO,
+                ctypes.byref(status),
+                ctypes.sizeof(status),
+                ctypes.byref(needed),
+            ):
+                code = ctypes.get_last_error()
+                raise OSError(code, f"QueryServiceStatusEx failed ({code})")
+            token = _SCM_STATE_TOKENS.get(int(status.dwCurrentState), "ERROR")
+            return token, int(status.dwProcessId), int(status.dwWin32ExitCode)
+        finally:
+            advapi.CloseServiceHandle(handle)
+    finally:
+        advapi.CloseServiceHandle(manager)
+
+
+def _read_service_registry(service_name: str) -> tuple[str, str | None]:
+    try:
+        import winreg
+    except ImportError:
+        return "", None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            rf"SYSTEM\CurrentControlSet\Services\{service_name}",
+        ) as key:
+            try:
+                image_path = str(winreg.QueryValueEx(key, "ImagePath")[0])
+            except OSError:
+                image_path = ""
+            try:
+                strategy = str(winreg.QueryValueEx(key, STRATEGY_VALUE_NAME)[0]).strip() or None
+            except OSError:
+                strategy = None
+    except OSError:
+        return "", None
+    return image_from_image_path(image_path), strategy
 
 
 def map_sc_query(
@@ -564,7 +765,7 @@ def install_service(
     allow_live: bool = False,
     privileged: bool | None = None,
     on_step: StepObserver | None = None,
-    waiter: Callable[..., ServiceWait] | None = None,
+    waiter: Waiter | None = None,
 ) -> ScmOpResult:
     """Install and start the strategy service.
 
@@ -607,11 +808,7 @@ def _chained_install_command(
     )
 
 
-def _execute_plan_step(
-    step: PlanStep,
-    run: ScmRunner,
-    on_step: StepObserver | None,
-) -> StepReport:
+def _execute_plan_step(step: PlanStep, run: ScmRunner) -> StepReport:
     if step.kind == "tcp":
         probe = build_tcp_probe_command(step.command.service_name)
         try:
@@ -619,7 +816,7 @@ def _execute_plan_step(
         except Exception:
             seen = CompletedScm(returncode=1)
         if tcp_timestamps_enabled(seen.stdout):
-            report = StepReport(
+            return StepReport(
                 kind="tcp",
                 command_line=probe.command_line,
                 returncode=0,
@@ -628,14 +825,11 @@ def _execute_plan_step(
                 fatal=False,
                 note="timestamps already enabled",
             )
-            if on_step is not None:
-                on_step(report)
-            return report
 
     try:
         completed = run(step.command)
     except Exception as exc:
-        report = StepReport(
+        return StepReport(
             kind=step.kind,
             command_line=step.command.command_line,
             returncode=-1,
@@ -644,21 +838,57 @@ def _execute_plan_step(
             fatal=step.fatal,
             note="the command could not be launched",
         )
-    else:
-        code = int(completed.returncode)
-        report = StepReport(
-            kind=step.kind,
-            command_line=step.command.command_line,
-            returncode=code,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            ok=code in step.ok_codes,
-            fatal=step.fatal,
-            note="" if code == 0 else describe_sc_error(code),
-        )
-    if on_step is not None:
-        on_step(report)
-    return report
+    code = int(completed.returncode)
+    return StepReport(
+        kind=step.kind,
+        command_line=step.command.command_line,
+        returncode=code,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        ok=code in step.ok_codes,
+        fatal=step.fatal,
+        note="" if code == 0 else describe_sc_error(code),
+    )
+
+
+def _settle_stop(
+    report: StepReport,
+    wait: Waiter,
+    service_name: str,
+    runner: ScmRunner | None,
+) -> StepReport:
+    """Wait for STOPPED the way ``net stop`` blocks; ``sc stop`` returns at STOP_PENDING."""
+    settled = wait(service_name, target=("stopped", "not_installed"), timeout_s=STOP_SETTLE_S, runner=runner)
+    if settled.reached:
+        return replace(report, note="stopped")
+    # service.bat swallows a failed `net stop` and carries on; the delete wait decides.
+    return replace(report, note=f"still {settled.token or settled.status.state} after {STOP_SETTLE_S:g} s")
+
+
+def _settle_delete(
+    report: StepReport,
+    wait: Waiter,
+    service_name: str,
+    runner: ScmRunner | None,
+) -> StepReport:
+    """A deleted service lingers, marked, until it stops and every handle to it closes.
+
+    ``sc create`` issued inside that window fails with 1072.
+    """
+    gone = wait(service_name, target=("not_installed",), timeout_s=DELETE_SETTLE_S, runner=runner)
+    if gone.reached:
+        return replace(report, note="removed")
+    return replace(
+        report,
+        returncode=ERROR_SERVICE_MARKED_FOR_DELETE,
+        stdout="",
+        stderr=(
+            f"{service_name} is still marked for deletion after {DELETE_SETTLE_S:g} s; "
+            "close services.msc or Event Viewer and retry"
+        ),
+        ok=False,
+        note=describe_sc_error(ERROR_SERVICE_MARKED_FOR_DELETE),
+    )
 
 
 def run_install_sequence(
@@ -669,14 +899,15 @@ def run_install_sequence(
     runner: ScmRunner | None = None,
     privileged: bool | None = None,
     on_step: StepObserver | None = None,
-    waiter: Callable[..., ServiceWait] | None = None,
+    waiter: Waiter | None = None,
 ) -> ScmOpResult:
     """Walk install_plan(), then confirm the service actually reached RUNNING.
 
     Unelevated: one UAC ``cmd /c a & b & c`` for the whole chain. Its ``sc``
     output cannot be captured, so the result is ``verified=False`` — the caller
     must re-query rather than report success.
-    Elevated: each step runs in this process with stdout/stderr captured.
+    Elevated: each step runs in this process with stdout/stderr captured, and the
+    stop and delete steps wait for SCM to settle before the next command.
     """
     plan = install_plan(image, args, service_name)
     chained = _chained_install_command(plan, image, args, service_name)
@@ -712,11 +943,18 @@ def run_install_sequence(
         )
 
     run = runner or _run_subprocess
+    wait = waiter or wait_for_state
     reports: list[StepReport] = []
     last: CompletedScm | None = None
     for step in plan:
-        report = _execute_plan_step(step, run, on_step)
+        report = _execute_plan_step(step, run)
+        if step.kind == "stop" and report.returncode == 0:
+            report = _settle_stop(report, wait, service_name, runner)
+        elif step.kind == "delete" and report.returncode in (0, ERROR_SERVICE_MARKED_FOR_DELETE):
+            report = _settle_delete(report, wait, service_name, runner)
         reports.append(report)
+        if on_step is not None:
+            on_step(report)
         last = CompletedScm(report.returncode, report.stdout, report.stderr)
         if not report.ok and step.fatal:
             return ScmOpResult(
@@ -729,22 +967,22 @@ def run_install_sequence(
                 needs_elevation=False,
             )
 
-    wait = (waiter or wait_for_state)(service_name, target=("running",), runner=runner)
-    verify = _verify_report(service_name, wait, "running")
+    settled = wait(service_name, target=("running",), runner=runner)
+    verify = _verify_report(service_name, settled, "running")
     reports.append(verify)
     if on_step is not None:
         on_step(verify)
 
     return ScmOpResult(
-        ok=wait.reached,
+        ok=settled.reached,
         command=chained,
-        status=wait.status,
-        error=None if wait.reached else f"Service did not reach RUNNING: {verify.note}",
+        status=settled.status,
+        error=None if settled.reached else f"Service did not reach RUNNING: {verify.note}",
         executed=True,
         completed=last,
         steps=tuple(reports),
         verified=True,
-        pid=wait.pid,
+        pid=settled.pid,
     )
 
 
@@ -778,7 +1016,7 @@ def start_service(
     runner: ScmRunner | None = None,
     allow_live: bool = False,
     privileged: bool | None = None,
-    waiter: Callable[..., ServiceWait] | None = None,
+    waiter: Waiter | None = None,
 ) -> ScmOpResult:
     return _execute_verified(
         build_start_command(service_name, image=image, args=args),
@@ -799,7 +1037,7 @@ def stop_service(
     runner: ScmRunner | None = None,
     allow_live: bool = False,
     privileged: bool | None = None,
-    waiter: Callable[..., ServiceWait] | None = None,
+    waiter: Waiter | None = None,
 ) -> ScmOpResult:
     return _execute_verified(
         build_stop_command(service_name, image=image, args=args),
@@ -820,7 +1058,7 @@ def _execute_verified(
     runner: ScmRunner | None,
     allow_live: bool,
     privileged: bool | None,
-    waiter: Callable[..., ServiceWait] | None,
+    waiter: Waiter | None,
 ) -> ScmOpResult:
     """execute_scm plus a state poll, on the live in-process path only.
 
@@ -853,6 +1091,8 @@ def _execute_verified(
 
 RemoveKind = Literal["stop", "delete", "taskkill"]
 WINDIVERT_SERVICES = ("WinDivert", "WinDivert14")
+# service.bat:221-222 silences these (`>nul 2>&1`); their failures never matter.
+REMOVE_ADVISORY = frozenset({"WinDivert14"})
 
 
 @dataclass(frozen=True)
@@ -931,15 +1171,112 @@ def plan_remove_steps(service_name: str = SERVICE_NAME) -> tuple[RemoveStep, ...
 
 def _remove_report(step: RemoveStep, completed: CompletedScm) -> StepReport:
     code = int(completed.returncode)
-    kind: StepKind = "stop" if step.kind == "stop" else "delete"
+    if code == 0:
+        note = ""
+    elif step.kind == "taskkill" and code == ERROR_TASKKILL_NOT_FOUND:
+        note = "winws.exe was not running"
+    else:
+        note = describe_sc_error(code)
     return StepReport(
-        kind=kind,
+        kind=step.kind,
         command_line=step.command_line,
         returncode=code,
         stdout=completed.stdout,
         stderr=completed.stderr,
         ok=code in step.ok_codes,
-        note="" if code == 0 else describe_sc_error(code),
+        fatal=step.target not in REMOVE_ADVISORY,
+        note=note,
+    )
+
+
+def _walk_remove_steps(
+    steps: tuple[RemoveStep, ...],
+    run: RemoveRunner,
+    wait: Waiter | None,
+    on_step: StepObserver | None,
+) -> tuple[list[StepReport], CompletedScm | None, list[str]]:
+    """Run every step like service.bat does: a failure is reported, never an abort."""
+    reports: list[StepReport] = []
+    failures: list[str] = []
+    last: CompletedScm | None = None
+    for step in steps:
+        try:
+            completed = run(step)
+        except Exception as exc:
+            completed = CompletedScm(returncode=-1, stderr=str(exc))
+        last = completed
+        report = _remove_report(step, completed)
+        if (
+            wait is not None
+            and step.kind == "stop"
+            and completed.returncode == 0
+            and step.target not in REMOVE_ADVISORY
+        ):
+            # `net stop` in the bat blocks until STOPPED before its `sc delete`.
+            settled = wait(step.target, target=("stopped", "not_installed"), timeout_s=STOP_SETTLE_S)
+            report = replace(
+                report,
+                note="stopped"
+                if settled.reached
+                else f"still {settled.token or settled.status.state} after {STOP_SETTLE_S:g} s",
+            )
+        reports.append(report)
+        if on_step is not None:
+            on_step(report)
+        if not report.ok and report.fatal:
+            detail = " ".join((completed.stderr or completed.stdout or "").split()) or report.note
+            failures.append(f"{step.kind} {step.target} failed ({completed.returncode}): {detail or 'no output'}")
+    return reports, last, failures
+
+
+def _remove_outcome(
+    *,
+    steps: tuple[RemoveStep, ...],
+    reports: list[StepReport],
+    last: CompletedScm | None,
+    failures: list[str],
+    wait: Waiter | None,
+    on_step: StepObserver | None,
+    service_name: str,
+    needs_elevation: bool,
+) -> RemoveResult:
+    if wait is not None:
+        gone = wait(service_name, target=("not_installed",), timeout_s=DELETE_SETTLE_S)
+        verify = StepReport(
+            kind="verify",
+            command_line=build_queryex_command(service_name).command_line,
+            returncode=0 if gone.reached else 1,
+            stdout=gone.status.raw,
+            ok=gone.reached,
+            note="NOT INSTALLED"
+            if gone.reached
+            else f"{service_name} is still installed ({gone.token or gone.status.state})",
+        )
+        reports.append(verify)
+        if on_step is not None:
+            on_step(verify)
+        ok = gone.reached
+        if not ok:
+            failures.append(verify.note)
+    else:
+        zapret_delete = next(
+            (
+                report
+                for step, report in zip(steps, reports)
+                if step.kind == "delete" and step.target == service_name
+            ),
+            None,
+        )
+        ok = zapret_delete is not None and zapret_delete.ok
+    return RemoveResult(
+        ok=ok,
+        steps=steps,
+        executed=True,
+        error="; ".join(failures) or None,
+        completed=last,
+        needs_elevation=needs_elevation,
+        reports=tuple(reports),
+        verified=True,
     )
 
 
@@ -950,52 +1287,30 @@ def remove_service(
     allow_live: bool = False,
     privileged: bool | None = None,
     on_step: StepObserver | None = None,
+    waiter: Waiter | None = None,
 ) -> RemoveResult:
-    """Remove zapret + leftover winws + WinDivert. Refuse-by-default without allow_live/runner."""
+    """Stop and remove zapret, kill leftover winws, drop WinDivert.
+
+    Like service.bat :service_remove every step runs even when an earlier one
+    fails; the verdict is whether ``zapret`` is actually gone. Refuses live SCM
+    mutation without ``allow_live`` or an injected ``runner``. On the runner path
+    the settle waits run only when a ``waiter`` is supplied.
+    """
     steps = plan_remove_steps(service_name)
     is_admin = is_process_elevated() if privileged is None else privileged
     needs_elevation = not is_admin
-    reports: list[StepReport] = []
 
     if runner is not None:
-        last: CompletedScm | None = None
-        try:
-            for step in steps:
-                completed = runner(step)
-                last = completed
-                report = _remove_report(step, completed)
-                reports.append(report)
-                if on_step is not None:
-                    on_step(report)
-                if int(completed.returncode) not in step.ok_codes:
-                    detail = (completed.stderr or completed.stdout or "").strip()
-                    return RemoveResult(
-                        ok=False,
-                        steps=steps,
-                        executed=True,
-                        error=f"{step.kind} {step.target} failed ({completed.returncode}): {detail or 'no output'}",
-                        completed=completed,
-                        needs_elevation=needs_elevation,
-                        reports=tuple(reports),
-                        verified=True,
-                    )
-        except Exception as exc:
-            return RemoveResult(
-                ok=False,
-                steps=steps,
-                executed=False,
-                error=str(exc),
-                needs_elevation=needs_elevation,
-                reports=tuple(reports),
-            )
-        return RemoveResult(
-            ok=True,
+        reports, last, failures = _walk_remove_steps(steps, runner, waiter, on_step)
+        return _remove_outcome(
             steps=steps,
-            executed=True,
-            completed=last,
+            reports=reports,
+            last=last,
+            failures=failures,
+            wait=waiter,
+            on_step=on_step,
+            service_name=service_name,
             needs_elevation=needs_elevation,
-            reports=tuple(reports),
-            verified=True,
         )
 
     if not allow_live:
@@ -1007,66 +1322,49 @@ def remove_service(
             needs_elevation=needs_elevation,
         )
 
-    chained = " & ".join(step.command_line for step in steps)
-    try:
-        if not is_admin:
+    if not is_admin:
+        chained = " & ".join(step.command_line for step in steps)
+        try:
             native = shell_execute("cmd.exe", f"/c {chained}", "runas")
-            if native <= 32:
-                from zapret_gui.privileges import describe_shellexecute_failure
-
-                return RemoveResult(
-                    ok=False,
-                    steps=steps,
-                    executed=False,
-                    error=f"Elevation failed: {describe_shellexecute_failure(native)}",
-                    needs_elevation=True,
-                )
-            # cmd.exe launched; whether sc succeeded is not observable from here.
+        except Exception as exc:
             return RemoveResult(
-                ok=True,
+                ok=False,
                 steps=steps,
-                executed=True,
+                executed=False,
+                error=f"Remove failed: {exc}",
                 needs_elevation=True,
-                verified=False,
             )
-        last = None
-        for step in steps:
-            completed = _run_argv(step.argv)
-            last = completed
-            report = _remove_report(step, completed)
-            reports.append(report)
-            if on_step is not None:
-                on_step(report)
-            if int(completed.returncode) not in step.ok_codes:
-                detail = (completed.stderr or completed.stdout or "").strip()
-                return RemoveResult(
-                    ok=False,
-                    steps=steps,
-                    executed=True,
-                    error=f"{step.kind} {step.target} failed ({completed.returncode}): {detail or 'no output'}",
-                    completed=completed,
-                    needs_elevation=False,
-                    reports=tuple(reports),
-                    verified=True,
-                )
+        if native <= 32:
+            from zapret_gui.privileges import describe_shellexecute_failure
+
+            return RemoveResult(
+                ok=False,
+                steps=steps,
+                executed=False,
+                error=f"Elevation failed: {describe_shellexecute_failure(native)}",
+                needs_elevation=True,
+            )
+        # cmd.exe launched; whether sc succeeded is not observable from here.
         return RemoveResult(
             ok=True,
             steps=steps,
             executed=True,
-            completed=last,
-            needs_elevation=False,
-            reports=tuple(reports),
-            verified=True,
+            needs_elevation=True,
+            verified=False,
         )
-    except Exception as exc:
-        return RemoveResult(
-            ok=False,
-            steps=steps,
-            executed=False,
-            error=f"Remove failed: {exc}",
-            needs_elevation=needs_elevation,
-            reports=tuple(reports),
-        )
+
+    wait = waiter or wait_for_state
+    reports, last, failures = _walk_remove_steps(steps, lambda step: _run_argv(step.argv), wait, on_step)
+    return _remove_outcome(
+        steps=steps,
+        reports=reports,
+        last=last,
+        failures=failures,
+        wait=wait,
+        on_step=on_step,
+        service_name=service_name,
+        needs_elevation=False,
+    )
 
 
 def execute_scm(

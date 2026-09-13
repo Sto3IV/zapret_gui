@@ -1,10 +1,10 @@
 {
   "en": {
     "installButton": "Install Service",
-    "startButton": "Start",
-    "stopButton": "Stop",
     "removeButton": "Remove",
-    "statusButton": "Status",
+    "testsButton": "Tests",
+    "diagnosticsButton": "Diagnostics",
+    "testsHint": "Don't know what strategy to use? Run tests and it will choose the best strategy for you!",
     "backupButton": "Backup",
     "saveButton": "Save",
     "backupAllButton": "Backup all lists",
@@ -25,16 +25,24 @@
     "gameFilter_tcp": "TCP only",
     "gameFilter_udp": "UDP only",
     "privilegeElevated": "ELEVATED",
-    "privilegeNotElevated": "NOT ELEVATED — service install/start/stop will request UAC",
+    "privilegeNotElevated": "NOT ELEVATED — installing or removing the service will request UAC",
     "listEditorPlaceholder": "Select a file from lists/ to edit it here.",
-    "argsPlaceholder": "Resolved winws.exe arguments appear here."
+    "argsPlaceholder": "Resolved winws.exe arguments appear here.",
+    "statusRunning": "RUNNING",
+    "statusStarting": "STARTING…",
+    "statusStopping": "STOPPING…",
+    "statusStopped": "STOPPED",
+    "statusNotInstalled": "NOT INSTALLED",
+    "statusError": "ERROR",
+    "diagConflictsPrompt": "Do you want to remove these conflicting services?",
+    "diagDiscordPrompt": "Do you want to clear the Discord cache (Stable, PTB, Canary, Development)?"
   },
   "ru": {
     "installButton": "Установить службу",
-    "startButton": "Запустить",
-    "stopButton": "Остановить",
     "removeButton": "Удалить",
-    "statusButton": "Статус",
+    "testsButton": "Тесты",
+    "diagnosticsButton": "Диагностика",
+    "testsHint": "Не знаете, какую стратегию выбрать? Запустите тесты — они подберут лучшую стратегию за вас!",
     "backupButton": "Резервная копия",
     "saveButton": "Сохранить",
     "backupAllButton": "Резерв всех списков",
@@ -55,8 +63,16 @@
     "gameFilter_tcp": "только TCP",
     "gameFilter_udp": "только UDP",
     "privilegeElevated": "С ПРАВАМИ АДМИНИСТРАТОРА",
-    "privilegeNotElevated": "НЕТ ПРАВ АДМИНИСТРАТОРА — установка/запуск/остановка службы запросит UAC",
+    "privilegeNotElevated": "НЕТ ПРАВ АДМИНИСТРАТОРА — установка и удаление службы запросят UAC",
     "listEditorPlaceholder": "Выберите файл из lists/, чтобы править его здесь.",
-    "argsPlaceholder": "Разрешённые аргументы winws.exe появятся здесь."
+    "argsPlaceholder": "Разрешённые аргументы winws.exe появятся здесь.",
+    "statusRunning": "РАБОТАЕТ",
+    "statusStarting": "ЗАПУСК…",
+    "statusStopping": "ОСТАНОВКА…",
+    "statusStopped": "ОСТАНОВЛЕНА",
+    "statusNotInstalled": "НЕ УСТАНОВЛЕНА",
+    "statusError": "ОШИБКА",
+    "diagConflictsPrompt": "Удалить эти конфликтующие службы?",
+    "diagDiscordPrompt": "Очистить кэш Discord (Stable, PTB, Canary, Development)?"
   }
 }

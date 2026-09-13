@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+import pytest
 
 from zapret_gui import SERVICE_NAME
 from zapret_gui.services import (
@@ -9,6 +12,7 @@ from zapret_gui.services import (
     ERROR_SERVICE_REQUEST_TIMEOUT,
     CompletedScm,
     ScmCommand,
+    ServiceSnapshot,
     ServiceStatus,
     ServiceWait,
     build_install_command,
@@ -20,10 +24,14 @@ from zapret_gui.services import (
     execute_scm,
     exit_code_hint,
     extract_pid,
+    image_from_image_path,
+    image_install_root,
+    image_is_under,
     install_plan,
     install_service,
     live_install_steps,
     map_sc_query,
+    query_service_snapshot,
     query_service_status,
     run_install_sequence,
     start_service,
@@ -41,10 +49,28 @@ def _parsed(project_root: Path):
     return parse_strategy(project_root / "general.bat", project_root)
 
 
-def _waiter(*, state: str = "running", pid: int | None = None, reached: bool = True, raw: str = ""):
-    """Stand in for wait_for_state so no test ever polls a real service."""
+def _waiter(
+    *,
+    state: str = "running",
+    pid: int | None = None,
+    reached: bool = True,
+    raw: str = "",
+    settle: bool = True,
+):
+    """Stand in for wait_for_state so no test ever polls a real service.
 
-    def waiter(service_name: str = SERVICE_NAME, **_kwargs) -> ServiceWait:
+    The install/remove settle waits (targets without "running") succeed unless
+    ``settle=False``; the configured outcome applies to everything else.
+    """
+
+    def waiter(service_name: str = SERVICE_NAME, *, target=("running",), **_kwargs) -> ServiceWait:
+        target = tuple(target)
+        if settle and "running" not in target:
+            gone = "not_installed" if target == ("not_installed",) else "stopped"
+            return ServiceWait(
+                status=ServiceStatus(state=gone, service_name=service_name, message=gone),  # type: ignore[arg-type]
+                reached=True,
+            )
         return ServiceWait(
             status=ServiceStatus(
                 state=state,  # type: ignore[arg-type]
@@ -52,6 +78,27 @@ def _waiter(*, state: str = "running", pid: int | None = None, reached: bool = T
                 message=f'Service "{service_name}" is {state}',
                 raw=raw,
             ),
+            reached=reached,
+            pid=pid,
+        )
+
+    return waiter
+
+
+def _recording_waiter(events: list[str], *, gone: bool = True, stopped: bool = True, pid: int | None = None):
+    """A waiter that logs each wait into the same timeline as the commands."""
+
+    def waiter(service_name: str = SERVICE_NAME, *, target=("running",), **_kwargs) -> ServiceWait:
+        target = tuple(target)
+        events.append("wait:" + "|".join(target))
+        if "running" in target:
+            state, reached = "running", True
+        elif target == ("not_installed",):
+            state, reached = ("not_installed" if gone else "stopped"), gone
+        else:
+            state, reached = "stopped", stopped
+        return ServiceWait(
+            status=ServiceStatus(state=state, service_name=service_name, message=state),  # type: ignore[arg-type]
             reached=reached,
             pid=pid,
         )
@@ -269,7 +316,6 @@ def test_elevated_live_install_runs_service_bat_sequence(project_root: Path, mon
     assert list(seen[2].argv) == list(expected_stop.argv)
     assert list(seen[3].argv) == list(expected_delete.argv)
     assert list(seen[4].argv) == list(expected_create.argv)
-    assert seen[4].argv.index("create") < len(seen[4].argv)
     assert list(seen[6].argv) == ["sc.exe", "start", SERVICE_NAME]
     blob = " ".join(seen[4].argv)
     assert parsed.image in blob
@@ -294,6 +340,120 @@ def test_install_issues_sc_start_after_sc_create(project_root: Path, monkeypatch
     assert "start" in kinds, "install must issue sc start"
     assert kinds.index("start") > kinds.index("create")
     assert result.ok is True
+
+
+def test_install_waits_for_scm_to_settle_like_net_stop(project_root: Path, monkeypatch) -> None:
+    """Replacing a running service: STOPPED before delete, gone before create.
+
+    `sc stop` returns at STOP_PENDING and `sc delete` on a stopping service only
+    marks it, so an immediate `sc create` fails with 1072. Proven live on a
+    scratch service before this wait existed.
+    """
+    parsed = _parsed(project_root)
+    events: list[str] = []
+
+    def run(cmd: ScmCommand) -> CompletedScm:
+        events.append(cmd.action)
+        if cmd.argv[:5] == TCP_PROBE_ARGV:
+            return CompletedScm(returncode=0, stdout="RFC 1323 Timestamps : enabled\n")
+        return CompletedScm(returncode=0, stdout="ok")
+
+    monkeypatch.setattr("zapret_gui.services._run_subprocess", run)
+    result = install_service(
+        parsed.image,
+        parsed.args_line,
+        allow_live=True,
+        privileged=True,
+        waiter=_recording_waiter(events, pid=7),
+    )
+    assert result.ok is True
+    assert events == [
+        "tcp",
+        "stop",
+        "wait:stopped|not_installed",
+        "delete",
+        "wait:not_installed",
+        "install",
+        "describe",
+        "start",
+        "wait:running",
+    ]
+    notes = {report.kind: report.note for report in result.steps}
+    assert notes["stop"] == "stopped"
+    assert notes["delete"] == "removed"
+
+
+def test_install_skips_settle_waits_when_nothing_was_running(project_root: Path, monkeypatch) -> None:
+    parsed = _parsed(project_root)
+    events: list[str] = []
+    seen: list[ScmCommand] = []
+    runner = _sequence_runner(seen, timestamps="enabled", codes={"stop": 1062, "delete": 1060})
+
+    def run(cmd: ScmCommand) -> CompletedScm:
+        events.append(cmd.action)
+        return runner(cmd)
+
+    monkeypatch.setattr("zapret_gui.services._run_subprocess", run)
+    result = install_service(
+        parsed.image,
+        parsed.args_line,
+        allow_live=True,
+        privileged=True,
+        waiter=_recording_waiter(events),
+    )
+    assert result.ok is True
+    assert events == ["tcp", "stop", "delete", "install", "describe", "start", "wait:running"]
+
+
+def test_install_fails_clearly_when_the_deleted_service_never_goes(project_root: Path, monkeypatch) -> None:
+    parsed = _parsed(project_root)
+    events: list[str] = []
+
+    def run(cmd: ScmCommand) -> CompletedScm:
+        events.append(cmd.action)
+        if cmd.argv[:5] == TCP_PROBE_ARGV:
+            return CompletedScm(returncode=0, stdout="RFC 1323 Timestamps : enabled\n")
+        return CompletedScm(returncode=0, stdout="ok")
+
+    monkeypatch.setattr("zapret_gui.services._run_subprocess", run)
+    result = install_service(
+        parsed.image,
+        parsed.args_line,
+        allow_live=True,
+        privileged=True,
+        waiter=_recording_waiter(events, gone=False),
+    )
+    assert result.ok is False
+    assert "1072" in (result.error or "")
+    assert "marked for deletion" in (result.error or "")
+    assert "services.msc" in (result.error or "")
+    assert "install" not in events, "sc create must not be issued while the entry still exists"
+    assert [report.kind for report in result.steps][-1] == "delete"
+
+
+def test_install_carries_on_when_stop_is_slow_and_delete_settles(project_root: Path, monkeypatch) -> None:
+    """A slow `net stop` in the bat is swallowed; the delete wait is what decides."""
+    parsed = _parsed(project_root)
+    events: list[str] = []
+
+    def run(cmd: ScmCommand) -> CompletedScm:
+        events.append(cmd.action)
+        if cmd.argv[:5] == TCP_PROBE_ARGV:
+            return CompletedScm(returncode=0, stdout="RFC 1323 Timestamps : enabled\n")
+        return CompletedScm(returncode=0, stdout="ok")
+
+    monkeypatch.setattr("zapret_gui.services._run_subprocess", run)
+    result = install_service(
+        parsed.image,
+        parsed.args_line,
+        allow_live=True,
+        privileged=True,
+        waiter=_recording_waiter(events, stopped=False),
+    )
+    assert result.ok is True
+    stop = next(report for report in result.steps if report.kind == "stop")
+    assert stop.ok is True
+    assert "after 20 s" in stop.note
 
 
 def test_elevated_install_tolerates_stop_delete_missing(project_root: Path, monkeypatch) -> None:
@@ -471,6 +631,30 @@ def test_wait_for_state_polls_until_running() -> None:
     assert list(calls[0].argv) == list(build_queryex_command(SERVICE_NAME).argv)
 
 
+def test_wait_for_state_treats_stop_pending_as_unsettled() -> None:
+    states = [
+        "STATE : 3  STOP_PENDING\n",
+        "STATE : 1  STOPPED\n",
+    ]
+    calls: list[ScmCommand] = []
+    ticks = iter([0.0, 1.0, 2.0, 3.0])
+
+    def runner(cmd: ScmCommand) -> CompletedScm:
+        calls.append(cmd)
+        return CompletedScm(returncode=0, stdout=states[min(len(calls) - 1, len(states) - 1)])
+
+    wait = wait_for_state(
+        SERVICE_NAME,
+        target=("stopped", "not_installed"),
+        runner=runner,
+        clock=lambda: next(ticks),
+        sleeper=lambda _s: None,
+    )
+    assert wait.reached is True
+    assert wait.token == "STOPPED"
+    assert wait.polls == 2
+
+
 def test_wait_for_state_gives_up_at_the_deadline() -> None:
     stopped = "SERVICE_NAME: zapret\n  STATE : 1  STOPPED\n  WIN32_EXIT_CODE : 1077  (0x435)\n  PID : 0\n"
     ticks = iter([0.0, 99.0, 99.0])
@@ -502,10 +686,12 @@ def test_wait_for_state_does_not_poll_a_missing_service() -> None:
 
 def test_describe_sc_error_covers_the_codes_the_gui_shows() -> None:
     assert describe_sc_error(0) == "success"
-    for code in (2, 5, 1053, 1056, 1058, 1060, 1062, 1072, 1073, 1077):
+    for code in (2, 5, 1053, 1056, 1058, 1060, 1062, 1072, 1073, 1077, 1078):
         text = describe_sc_error(code)
         assert text and not text.startswith("exit code")
     assert "never been started" in describe_sc_error(ERROR_SERVICE_NEVER_STARTED)
+    # 1072 is a wait-it-out condition, not a reboot.
+    assert "reboot" not in describe_sc_error(1072)
     assert describe_sc_error(31337) == "exit code 31337"
 
 
@@ -537,7 +723,7 @@ def test_start_and_stop_verify_the_resulting_state(monkeypatch) -> None:
         SERVICE_NAME,
         allow_live=True,
         privileged=True,
-        waiter=_waiter(state="running", reached=False, raw=raw),
+        waiter=_waiter(state="running", reached=False, raw=raw, settle=False),
     )
     assert stuck.ok is False
     assert "STOPPED" in (stuck.error or "")
@@ -553,3 +739,42 @@ def test_execute_scm_runner_exception_is_handled(project_root: Path) -> None:
     result = execute_scm(cmd, runner=boom)
     assert result.ok is False
     assert "simulated scm failure" in (result.error or "")
+
+
+def test_image_path_helpers() -> None:
+    assert image_from_image_path('"E:\\.ZAPRET\\bin\\winws.exe"   --wf-tcp 80') == r"E:\.ZAPRET\bin\winws.exe"
+    assert image_from_image_path(r"C:\Tools\winws.exe --wf-tcp=80") == r"C:\Tools\winws.exe"
+    assert image_from_image_path("") == ""
+    assert image_install_root(r"E:\.ZAPRET\bin\winws.exe") == r"E:\.ZAPRET"
+    assert image_install_root(r"C:\Tools\winws.exe") == r"C:\Tools"
+    root = Path(r"S:\NEYRONKI\Zapret-GUI-project")
+    assert image_is_under(r"S:\NEYRONKI\Zapret-GUI-project\bin\winws.exe", root)
+    assert image_is_under(r"s:\neyronki\zapret-gui-project\BIN\winws.exe", root)
+    assert not image_is_under(r"E:\.ZAPRET\bin\winws.exe", root)
+    # Whole path components only: a sibling tree with a longer name is not inside.
+    assert not image_is_under(r"S:\NEYRONKI\Zapret-GUI-project-old\bin\winws.exe", root)
+
+
+def test_snapshot_state_folds_scm_tokens() -> None:
+    for token, state in (
+        ("RUNNING", "running"),
+        ("START_PENDING", "pending"),
+        ("CONTINUE_PENDING", "pending"),
+        ("STOP_PENDING", "pending"),
+        ("PAUSE_PENDING", "pending"),
+        ("STOPPED", "stopped"),
+        ("PAUSED", "stopped"),
+        ("NOT_INSTALLED", "not_installed"),
+        ("ERROR", "error"),
+    ):
+        assert ServiceSnapshot(SERVICE_NAME, token).state == state
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the SCM exists only on Windows")
+def test_query_service_snapshot_reports_a_missing_service() -> None:
+    """Read-only: opens the SCM with connect rights and asks about a name nobody uses."""
+    snapshot = query_service_snapshot("ZapretGuiNoSuchService")
+    assert snapshot.token == "NOT_INSTALLED"
+    assert snapshot.pid is None
+    assert snapshot.image == ""
+    assert snapshot.error == ""

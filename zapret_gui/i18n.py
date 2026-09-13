@@ -18,10 +18,9 @@ LANG_FILE = Path(__file__).with_name("lang.json")
 
 BUTTON_OBJECT_NAMES: tuple[str, ...] = (
     "installButton",
-    "startButton",
-    "stopButton",
     "removeButton",
-    "statusButton",
+    "testsButton",
+    "diagnosticsButton",
     "backupButton",
     "saveButton",
     "backupAllButton",
@@ -30,6 +29,10 @@ BUTTON_OBJECT_NAMES: tuple[str, ...] = (
     "languageButton",
     "clearConsoleButton",
 )
+
+# Window methods that re-render text built at runtime rather than from one key.
+_RERENDER_HOOKS = ("_refresh_privilege_banner", "_render_service_status")
+
 
 def default_lang_file() -> Path:
     return LANG_FILE
@@ -72,6 +75,11 @@ def apply_locale(
             continue
         widget.setText(table[name])
 
+    for button in window.findChildren(QPushButton):
+        key = button.property("i18nTooltip")
+        if key and str(key) in table:
+            button.setToolTip(table[str(key)])
+
     for label in window.findChildren(QLabel):
         key = label.property("i18n")
         if not key:
@@ -101,9 +109,10 @@ def apply_locale(
     if args is not None and "argsPlaceholder" in table:
         args.setPlaceholderText(table["argsPlaceholder"])
 
-    refresh = getattr(window, "_refresh_privilege_banner", None)
-    if callable(refresh):
-        refresh()
+    for hook in _RERENDER_HOOKS:
+        refresh = getattr(window, hook, None)
+        if callable(refresh):
+            refresh()
     return table
 
 

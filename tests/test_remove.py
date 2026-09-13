@@ -3,9 +3,43 @@ from __future__ import annotations
 from zapret_gui.services import (
     CompletedScm,
     RemoveStep,
+    ServiceStatus,
+    ServiceWait,
     plan_remove_steps,
     remove_service,
 )
+
+
+def _waiter(events: list | None = None, *, zapret_gone: bool = True):
+    """Fake wait_for_state: stops settle, the final 'gone' check is configurable."""
+
+    def waiter(service_name: str, *, target=("stopped",), **_kwargs) -> ServiceWait:
+        target = tuple(target)
+        if events is not None:
+            events.append(("wait", service_name, target))
+        if target == ("not_installed",):
+            reached = zapret_gone
+            state = "not_installed" if reached else "stopped"
+        else:
+            reached, state = True, "stopped"
+        return ServiceWait(
+            status=ServiceStatus(state=state, service_name=service_name, message=state),  # type: ignore[arg-type]
+            reached=reached,
+            token="" if reached else "STOPPED",
+        )
+
+    return waiter
+
+
+def _runner(events: list, codes: dict | None = None):
+    table = codes or {}
+
+    def run(step: RemoveStep) -> CompletedScm:
+        events.append((step.kind, step.target))
+        code = int(table.get((step.kind, step.target), 0))
+        return CompletedScm(returncode=code, stdout="ok" if code == 0 else "", stderr="" if code == 0 else "failed")
+
+    return run
 
 
 def test_remove_plan_covers_zapret_winws_and_windivert() -> None:
@@ -75,3 +109,60 @@ def test_remove_injected_runner_order_nonfatal_missing(monkeypatch) -> None:
     assert ("stop", "WinDivert14") in seen
     assert ("delete", "WinDivert14") in seen
     assert seen.index(("stop", "WinDivert")) > seen.index(("taskkill", "winws.exe"))
+    kill = next(report for report in result.reports if report.kind == "taskkill")
+    assert kill.note == "winws.exe was not running"
+
+
+def test_remove_continues_after_a_failed_step() -> None:
+    """service.bat :service_remove never aborts; neither does Remove."""
+    events: list = []
+    run = _runner(events, codes={("stop", "WinDivert"): 1052})
+    result = remove_service(runner=run, allow_live=False)
+
+    after_failure = events[events.index(("stop", "WinDivert")) + 1 :]
+    assert after_failure == [("delete", "WinDivert"), ("stop", "WinDivert14"), ("delete", "WinDivert14")]
+    failed = next(report for report in result.reports if report.command_line == "sc.exe stop WinDivert")
+    assert failed.ok is False and failed.fatal is True
+    # zapret itself went away, which is what Remove promises.
+    assert result.ok is True
+    assert "stop WinDivert failed (1052)" in (result.error or "")
+
+
+def test_remove_waits_after_stops_and_checks_zapret_is_gone() -> None:
+    events: list = []
+    run = _runner(events)
+    result = remove_service(runner=run, allow_live=False, waiter=_waiter(events))
+
+    assert events == [
+        ("stop", "zapret"),
+        ("wait", "zapret", ("stopped", "not_installed")),
+        ("delete", "zapret"),
+        ("taskkill", "winws.exe"),
+        ("stop", "WinDivert"),
+        ("wait", "WinDivert", ("stopped", "not_installed")),
+        ("delete", "WinDivert"),
+        # WinDivert14 is advisory in the bat (>nul 2>&1): no wait.
+        ("stop", "WinDivert14"),
+        ("delete", "WinDivert14"),
+        ("wait", "zapret", ("not_installed",)),
+    ]
+    assert result.ok is True
+    assert result.verified is True
+    assert [report.kind for report in result.reports][-1] == "verify"
+
+
+def test_remove_fails_when_zapret_survives() -> None:
+    events: list = []
+    result = remove_service(runner=_runner(events), allow_live=False, waiter=_waiter(events, zapret_gone=False))
+    assert result.ok is False
+    assert "zapret is still installed" in (result.error or "")
+
+
+def test_remove_advisory_windivert14_failure_is_not_an_error() -> None:
+    events: list = []
+    run = _runner(events, codes={("stop", "WinDivert14"): 1052, ("delete", "WinDivert14"): 5})
+    result = remove_service(runner=run, allow_live=False)
+    assert result.ok is True
+    assert result.error is None
+    advisory = [report for report in result.reports if "WinDivert14" in report.command_line]
+    assert advisory and all(report.fatal is False for report in advisory)

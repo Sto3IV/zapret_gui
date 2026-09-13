@@ -83,9 +83,30 @@ QLabel#privilegeBanner[elevated="false"] {{
     border: 1px solid {p["danger"]};
 }}
 QLabel#serviceStatusLabel {{
-    color: {p["fg"]};
-    font-weight: 600;
-    padding: 4px 0;
+    color: {p["fg_muted"]};
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    padding-top: 3px;
+}}
+QLabel#serviceStatusLabel[state="running"] {{
+    color: {p["success"]};
+}}
+QLabel#serviceStatusLabel[state="pending"] {{
+    color: {p["attention"]};
+}}
+QLabel#serviceStatusLabel[state="stopped"] {{
+    color: {p["danger"]};
+}}
+QLabel#serviceStatusLabel[state="not_installed"] {{
+    color: {p["fg_muted"]};
+}}
+QLabel#serviceStatusLabel[state="error"] {{
+    color: {p["danger"]};
+}}
+QLabel#testsHint {{
+    color: {p["fg_muted"]};
+    font-size: 11px;
 }}
 QPushButton {{
     background: {p["canvas_overlay"]};
@@ -117,11 +138,11 @@ QPushButton#installButton:hover, QPushButton#hostsButton:hover {{
     border-color: {p["accent_emphasis"]};
     color: {p["fg"]};
 }}
-QPushButton#stopButton, QPushButton#removeButton {{
+QPushButton#removeButton {{
     border-color: {p["danger"]};
     color: {p["fg"]};
 }}
-QPushButton#stopButton:hover, QPushButton#removeButton:hover {{
+QPushButton#removeButton:hover {{
     border-color: {p["danger"]};
     color: {p["danger"]};
 }}

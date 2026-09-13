@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QFileSystemWatcher, QSemaphore, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -38,6 +39,9 @@ from PySide6.QtWidgets import (
 )
 
 from zapret_gui import HOSTS_PATH, PROJECT_NAME, SERVICE_NAME, __version__
+from zapret_gui.diagnostics import DiagLine, default_probes, run_diagnostics
+from zapret_gui.i18n import apply_locale, load_catalog, lookup, toggle_locale
+from zapret_gui.identity import persist_installed_strategy, strategy_stem
 from zapret_gui.lists_io import (
     ListsError,
     backup_all_lists,
@@ -46,23 +50,23 @@ from zapret_gui.lists_io import (
     read_list,
     write_list,
 )
-from zapret_gui.paths import ProjectRootError, detect_project_root, winws_path
+from zapret_gui.paths import ProjectRootError, detect_project_root
 from zapret_gui.privileges import (
     HostsLaunchResult,
     is_process_elevated,
     launch_hosts_notepad,
     relaunch_self_elevated,
 )
-from zapret_gui.identity import persist_installed_strategy, strategy_stem
 from zapret_gui.services import (
     RemoveResult,
     ScmOpResult,
+    ServiceSnapshot,
     StepReport,
+    image_install_root,
+    image_is_under,
     install_service,
-    query_service_status,
+    query_service_snapshot,
     remove_service,
-    start_service,
-    stop_service,
 )
 from zapret_gui.strategies import (
     GAME_FILTER_MODES,
@@ -74,16 +78,25 @@ from zapret_gui.strategies import (
     save_game_filter,
 )
 from zapret_gui.theme import CONSOLE_FONT_FAMILY, GUI_FONT_FAMILY, PALETTE, STYLESHEET
-from zapret_gui.i18n import apply_locale, load_catalog, lookup, toggle_locale
+from zapret_gui.tools import (
+    POWERSHELL_REQUIRED,
+    RESULTS_DIR,
+    TESTS_STARTING,
+    find_best_strategy_line,
+    launch_tests,
+    newest_result_since,
+    powershell_supported,
+)
 
 REQUIRED_OBJECT_NAMES = (
     "hostsButton",
     "strategyCombo",
     "installButton",
-    "startButton",
-    "stopButton",
-    "statusButton",
     "removeButton",
+    "testsButton",
+    "diagnosticsButton",
+    "testsHint",
+    "serviceStatusLabel",
     "gameFilterCombo",
     "listFileList",
     "listEditor",
@@ -113,27 +126,93 @@ CONSOLE_TEXT = PALETTE["fg"]
 # the args preview, so the console shows a readable head of it.
 CONSOLE_COMMAND_LIMIT = 320
 
+# The header status line re-reads the SCM this often. One QueryServiceStatusEx
+# call costs ~0.1 ms, against ~35 ms and a process launch for `sc query`.
+STATUS_POLL_MS = 2000
+
+# SCM state token -> (lang-file key, fallback text, QSS state)
+STATUS_TOKENS: dict[str, tuple[str, str, str]] = {
+    "RUNNING": ("statusRunning", "RUNNING", "running"),
+    "START_PENDING": ("statusStarting", "STARTING…", "pending"),
+    "CONTINUE_PENDING": ("statusStarting", "STARTING…", "pending"),
+    "STOP_PENDING": ("statusStopping", "STOPPING…", "pending"),
+    "PAUSE_PENDING": ("statusStopping", "STOPPING…", "pending"),
+    "STOPPED": ("statusStopped", "STOPPED", "stopped"),
+    "PAUSED": ("statusStopped", "STOPPED", "stopped"),
+    "NOT_INSTALLED": ("statusNotInstalled", "NOT INSTALLED", "not_installed"),
+}
+STATUS_ERROR = ("statusError", "ERROR", "error")
+
+TESTS_HINT = "Don't know what strategy to use? Run tests and it will choose the best strategy for you!"
+
+# The results file lands at the very end of a run; if the watcher fires before
+# its `Best strategy:` line is written, look again shortly.
+RESULTS_RETRY_MS = 500
+RESULTS_RETRIES = 10
+# File times come from a coarser clock than time.time(); do not miss a file
+# stamped a moment "before" the launch was recorded.
+RESULTS_CLOCK_SLACK_S = 2.0
+
+# Dialog text when the lang-file lacks a key; service.bat's own prompts.
+PROMPT_FALLBACKS = {
+    "diagConflictsPrompt": "Do you want to remove these conflicting services?",
+    "diagDiscordPrompt": "Do you want to clear the Discord cache (Stable, PTB, Canary, Development)?",
+}
+
+
+class WorkerIO:
+    """What an action running on ScmWorker may call back into."""
+
+    def __init__(self, worker: "ScmWorker") -> None:
+        self._worker = worker
+
+    def step(self, report: StepReport) -> None:
+        self._worker.step.emit(report)
+
+    def line(self, line: DiagLine) -> None:
+        self._worker.line.emit(line)
+
+    def ask(self, key: str, default: bool) -> bool:
+        return self._worker.request_answer(key, default)
+
 
 class ScmWorker(QThread):
-    """Runs one blocking SCM action off the GUI thread.
+    """Runs one blocking action off the GUI thread.
 
     ``sc start`` can block for seconds and ``wait_for_state`` polls after it, so
-    running this inline would freeze the window for the whole install.
+    running this inline would freeze the window for the whole install. A
+    diagnostics prompt parks the worker on a semaphore until the GUI thread
+    answers, which keeps the check sequence as linear as the bat it ports.
     """
 
     step = Signal(object)
+    line = Signal(object)
+    question = Signal(object)
     done = Signal(object)
 
     def __init__(self, action, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._action = action
+        self._answer = False
+        self._answered = QSemaphore(0)
 
-    def run(self) -> None:  # pragma: no cover - exercised only on the live path
+    def run(self) -> None:
         try:
-            outcome = self._action(self.step.emit)
+            outcome = self._action(WorkerIO(self))
         except Exception as exc:
             outcome = exc
         self.done.emit(outcome)
+
+    def request_answer(self, key: str, default: bool) -> bool:
+        """Worker thread: hand the question to the GUI thread and wait for it."""
+        self.question.emit((key, bool(default)))
+        self._answered.acquire()
+        return self._answer
+
+    def provide_answer(self, answer: bool) -> None:
+        """GUI thread: unblock the worker with the user's choice."""
+        self._answer = bool(answer)
+        self._answered.release()
 
 
 class MainWindow(QMainWindow):
@@ -158,6 +237,7 @@ class MainWindow(QMainWindow):
             self._root_error = ""
 
         self.lists_dir = Path(lists_dir) if lists_dir else (self.project_root / "lists")
+        self.results_dir = self.project_root / RESULTS_DIR
         self._parsed: dict[str, ParsedStrategy] = {}
         self._current_list: Path | None = None
         self._editor_dirty = False
@@ -166,18 +246,30 @@ class MainWindow(QMainWindow):
         self._locale = "en"
         self._i18n_table = self._catalog["en"]
         self._worker: ScmWorker | None = None
-        # Parented so it dies with the window. A bare QTimer.singleShot bound to
+        self._last_snapshot: ServiceSnapshot | None = None
+        # Parented timers die with the window. A bare QTimer.singleShot bound to
         # a method would still fire after the window is gone, on a dead object.
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.timeout.connect(self._refresh_service_status)
+        self._status_timer.timeout.connect(self._poll_service_status)
+        self._status_poll = QTimer(self)
+        self._status_poll.setInterval(STATUS_POLL_MS)
+        self._status_poll.timeout.connect(self._poll_service_status)
+        self._results_since: float | None = None
+        self._results_tries = 0
+        self._results_watcher = QFileSystemWatcher(self)
+        self._results_watcher.directoryChanged.connect(self._on_results_changed)
+        self._results_retry = QTimer(self)
+        self._results_retry.setSingleShot(True)
+        self._results_retry.timeout.connect(self._check_results)
 
         self._build_ui()
         self._wire()
         apply_locale(self, "en", self._catalog)
         self._load_strategies()
         self._load_list_files()
-        self._refresh_service_status()
+        self._poll_service_status()
+        self._status_poll.start()
         if self._root_error:
             self._log(f"ERROR: {self._root_error}", error=True)
 
@@ -197,13 +289,22 @@ class MainWindow(QMainWindow):
 
         titles = QVBoxLayout()
         titles.setContentsMargins(0, 0, 0, 0)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(14)
         title = QLabel("ZAPRET CONTROL")
         title.setObjectName("titleLabel")
         title.setProperty("i18n", "titleLabel")
+        self.service_status_label = QLabel()
+        self.service_status_label.setObjectName("serviceStatusLabel")
+        self.service_status_label.setProperty("state", "pending")
+        title_row.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addWidget(self.service_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addStretch(1)
         subtitle = QLabel("STRATEGY SERVICES  ·  HOSTS  ·  LISTS")
         subtitle.setObjectName("subtitleLabel")
         subtitle.setProperty("i18n", "subtitleLabel")
-        titles.addWidget(title)
+        titles.addLayout(title_row)
         titles.addWidget(subtitle)
         left = QWidget()
         left.setLayout(titles)
@@ -259,7 +360,7 @@ class MainWindow(QMainWindow):
 
         refresh_action = QAction("Refresh status", self)
         refresh_action.setShortcut("F5")
-        refresh_action.triggered.connect(self._on_query_status)
+        refresh_action.triggered.connect(self._poll_service_status)
         self.addAction(refresh_action)
 
     def _build_service_panel(self) -> QWidget:
@@ -275,26 +376,36 @@ class MainWindow(QMainWindow):
         self.strategy_combo.setObjectName("strategyCombo")
         layout.addWidget(self.strategy_combo)
 
-        buttons = QHBoxLayout()
+        # Two buttons per row: the pair that changes the service, then the pair
+        # that inspects the machine.
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
         self.install_button = QPushButton("Install Service")
         self.install_button.setObjectName("installButton")
-        self.start_button = QPushButton("Start")
-        self.start_button.setObjectName("startButton")
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.setObjectName("stopButton")
-        self.status_button = QPushButton("Status")
-        self.status_button.setObjectName("statusButton")
         self.remove_button = QPushButton("Remove")
         self.remove_button.setObjectName("removeButton")
-        for btn in (
-            self.install_button,
-            self.start_button,
-            self.stop_button,
-            self.remove_button,
-            self.status_button,
-        ):
-            buttons.addWidget(btn)
-        layout.addLayout(buttons)
+        self.tests_button = QPushButton("Tests")
+        self.tests_button.setObjectName("testsButton")
+        self.tests_button.setProperty("i18nTooltip", "testsHint")
+        self.tests_button.setToolTip(TESTS_HINT)
+        self.diagnostics_button = QPushButton("Diagnostics")
+        self.diagnostics_button.setObjectName("diagnosticsButton")
+        grid.addWidget(self.install_button, 0, 0)
+        grid.addWidget(self.remove_button, 0, 1)
+        grid.addWidget(self.tests_button, 1, 0)
+        grid.addWidget(self.diagnostics_button, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        self.service_buttons_grid = grid
+        layout.addLayout(grid)
+
+        self.tests_hint = QLabel(TESTS_HINT)
+        self.tests_hint.setObjectName("testsHint")
+        self.tests_hint.setProperty("i18n", "testsHint")
+        self.tests_hint.setWordWrap(True)
+        layout.addWidget(self.tests_hint)
 
         filter_row = QHBoxLayout()
         filter_cap = QLabel("Game Filter")
@@ -307,10 +418,6 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(filter_cap)
         filter_row.addWidget(self.game_filter_combo, 1)
         layout.addLayout(filter_row)
-
-        self.service_status_label = QLabel("Status: unknown")
-        self.service_status_label.setObjectName("serviceStatusLabel")
-        layout.addWidget(self.service_status_label)
 
         self.args_preview = QPlainTextEdit()
         self.args_preview.setObjectName("argsPreview")
@@ -412,10 +519,9 @@ class MainWindow(QMainWindow):
         self.relaunch_button.clicked.connect(self._on_relaunch_admin)
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
         self.install_button.clicked.connect(self._on_install)
-        self.start_button.clicked.connect(self._on_start)
-        self.stop_button.clicked.connect(self._on_stop)
         self.remove_button.clicked.connect(self._on_remove)
-        self.status_button.clicked.connect(self._on_query_status)
+        self.tests_button.clicked.connect(self._on_tests)
+        self.diagnostics_button.clicked.connect(self._on_diagnostics)
         self.game_filter_combo.currentIndexChanged.connect(self._on_game_filter_changed)
         self.list_files_widget.currentItemChanged.connect(self._on_list_file_changed)
         self.list_editor.textChanged.connect(self._on_editor_changed)
@@ -435,7 +541,7 @@ class MainWindow(QMainWindow):
                 lookup(
                     self,
                     "privilegeNotElevated",
-                    "NOT ELEVATED — service install/start/stop will request UAC",
+                    "NOT ELEVATED — installing or removing the service will request UAC",
                 )
             )
             self.relaunch_button.show()
@@ -513,23 +619,28 @@ class MainWindow(QMainWindow):
     def _service_buttons(self) -> tuple[QPushButton, ...]:
         return (
             self.install_button,
-            self.start_button,
-            self.stop_button,
             self.remove_button,
-            self.status_button,
+            self.tests_button,
+            self.diagnostics_button,
         )
 
     def _run_scm(self, verb: str, action, reporter) -> None:
-        """Run ``action(emit_step)`` on a worker thread, streaming steps to the console."""
+        """Run ``action(worker_io)`` on a worker thread, streaming its output to the console."""
         if self._worker is not None:
             self._log(f"{verb} ignored: another service action is still running.", error=True)
             return
         self._console_header(verb)
         for button in self._service_buttons():
             button.setEnabled(False)
+        # A service handle held across `sc delete` defers the deletion and breaks
+        # the `sc create` right after it (1072), so the status poll sits this out.
+        self._status_poll.stop()
+        self._status_timer.stop()
         worker = ScmWorker(action, self)
         self._worker = worker
         worker.step.connect(self._console_step)
+        worker.line.connect(self._console_diag)
+        worker.question.connect(lambda payload, source=worker: self._answer_question(source, payload))
         worker.done.connect(lambda outcome: self._finish_scm(verb, reporter, outcome))
         worker.finished.connect(self._release_worker)
         worker.start()
@@ -556,6 +667,25 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.wait()
             worker.deleteLater()
+        self._poll_service_status()
+        self._status_poll.start()
+
+    def _answer_question(self, worker: ScmWorker, payload) -> None:
+        key, default = payload
+        text = lookup(self, key, PROMPT_FALLBACKS.get(key, key))
+        answer = bool(default)
+        try:
+            buttons = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            preferred = QMessageBox.StandardButton.Yes if default else QMessageBox.StandardButton.No
+            choice = QMessageBox.question(self, PROJECT_NAME, text, buttons, preferred)
+            answer = choice == QMessageBox.StandardButton.Yes
+        finally:
+            # service.bat echoes what was typed at its `set /p` prompt.
+            self._console_write(
+                f"{text} (Y/N) (default: {'Y' if default else 'N'}) {'Y' if answer else 'N'}\n",
+                CONSOLE_TEXT,
+            )
+            worker.provide_answer(answer)
 
     def _on_install(self) -> None:
         parsed = self._current_parsed()
@@ -569,8 +699,8 @@ class MainWindow(QMainWindow):
         stem = strategy_stem(parsed.name)
         image, args = parsed.image, parsed.args_line
 
-        def action(emit_step):
-            return install_service(image, args, allow_live=True, on_step=emit_step)
+        def action(worker_io: WorkerIO) -> ScmOpResult:
+            return install_service(image, args, allow_live=True, on_step=worker_io.step)
 
         self._run_scm(
             f"Install Service — {parsed.name}",
@@ -579,8 +709,10 @@ class MainWindow(QMainWindow):
         )
 
     def _after_install(self, stem: str, result: ScmOpResult) -> None:
-        # service.bat:362 records the strategy name after sc start.
-        if result.ok:
+        # service.bat:362 records the strategy name after sc start. A UAC-delegated
+        # install cannot be observed, so it must not stamp a name onto whichever
+        # service currently owns this service name.
+        if result.ok and not result.needs_elevation:
             ident = persist_installed_strategy(stem, allow_live=True)
             self._console_step(
                 StepReport(
@@ -596,42 +728,119 @@ class MainWindow(QMainWindow):
             )
         self._report_scm("Install", result)
 
-    def _on_start(self) -> None:
-        parsed = self._current_parsed()
-        image = parsed.image if parsed else str(winws_path(self.project_root)) if not self._root_error else ""
-        args = parsed.args_line if parsed else ""
-
-        def action(_emit_step):
-            return start_service(SERVICE_NAME, image=image, args=args, allow_live=True)
-
-        self._run_scm(
-            "Start",
-            action,
-            lambda result: self._report_scm("Start", result, render_steps=True),
-        )
-
-    def _on_stop(self) -> None:
-        parsed = self._current_parsed()
-        image = parsed.image if parsed else ""
-        args = parsed.args_line if parsed else ""
-
-        def action(_emit_step):
-            return stop_service(SERVICE_NAME, image=image, args=args, allow_live=True)
-
-        self._run_scm(
-            "Stop",
-            action,
-            lambda result: self._report_scm("Stop", result, render_steps=True),
-        )
-
-    def _on_query_status(self) -> None:
-        self._refresh_service_status()
-
     def _on_remove(self) -> None:
-        def action(emit_step):
-            return remove_service(allow_live=True, on_step=emit_step)
+        def action(worker_io: WorkerIO) -> RemoveResult:
+            return remove_service(allow_live=True, on_step=worker_io.step)
 
         self._run_scm("Remove", action, self._report_remove)
+
+    def _on_tests(self) -> None:
+        snapshot = self._last_snapshot
+        installed = snapshot is not None and snapshot.state in ("running", "pending", "stopped")
+
+        def action(worker_io: WorkerIO) -> bool:
+            # service.bat:1119-1126 refuses to go on without PowerShell 3.0+.
+            if powershell_supported():
+                return True
+            for text in POWERSHELL_REQUIRED:
+                worker_io.line(DiagLine("info", text))
+            return False
+
+        self._run_scm(
+            "Tests",
+            action,
+            lambda supported: self._after_tests_probe(bool(supported), installed),
+        )
+
+    def _after_tests_probe(self, supported: bool, installed: bool) -> None:
+        if not supported:
+            return
+        if installed:
+            # The script checks this itself (ps1:374-387) and exits; say so up front.
+            self._console_diag(
+                DiagLine(
+                    "warn",
+                    f"Windows service '{SERVICE_NAME}' is installed - "
+                    "the tests refuse to run until you press Remove",
+                )
+            )
+        self._console_diag(DiagLine("info", TESTS_STARTING))
+        # ShellExecute belongs on the GUI thread, where Qt has already initialised COM.
+        result = launch_tests(self.project_root, elevated=is_process_elevated())
+        if not result.ok:
+            message = result.error or "Failed to start the tests"
+            self._log(message, error=True)
+            QMessageBox.warning(self, PROJECT_NAME, message)
+            return
+        self._arm_results_watch(time.time())
+
+    def _arm_results_watch(self, started_at: float) -> None:
+        try:
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._log(f"Cannot watch {self.results_dir}: {exc}", error=True)
+            return
+        self._disarm_results_watch()
+        self._results_since = started_at - RESULTS_CLOCK_SLACK_S
+        self._results_tries = 0
+        self._results_watcher.addPath(str(self.results_dir))
+
+    def _disarm_results_watch(self) -> None:
+        self._results_since = None
+        self._results_retry.stop()
+        watched = self._results_watcher.directories()
+        if watched:
+            self._results_watcher.removePaths(watched)
+
+    def _on_results_changed(self, _path: str) -> None:
+        self._results_tries = 0
+        self._check_results()
+
+    def _check_results(self) -> None:
+        since = self._results_since
+        if since is None:
+            return
+        newest = newest_result_since(self.results_dir, since)
+        if newest is None:
+            return
+        try:
+            text = newest.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            text = ""
+        winner = find_best_strategy_line(text)
+        if winner is None:
+            # The file exists but its closing line has not landed yet.
+            if self._results_tries < RESULTS_RETRIES:
+                self._results_tries += 1
+                self._results_retry.start(RESULTS_RETRY_MS)
+            return
+        self._disarm_results_watch()
+        if not winner:
+            self._console_diag(DiagLine("warn", f"Tests finished without a working strategy ({newest.name})"))
+            return
+        index = self.strategy_combo.findText(winner)
+        if index < 0:
+            self._console_diag(DiagLine("warn", f"Tests picked {winner}, which is not in the strategy list"))
+            return
+        self.strategy_combo.setCurrentIndex(index)
+        self._console_write(
+            f"Tests picked {winner} — selected; press Install Service to use it\n",
+            CONSOLE_OK,
+            bold=True,
+        )
+
+    def _on_diagnostics(self) -> None:
+        root = self.project_root
+
+        def action(worker_io: WorkerIO) -> bool:
+            run_diagnostics(root, probes=default_probes(), emit=worker_io.line, ask=worker_io.ask)
+            return True
+
+        self._run_scm("Diagnostics", action, self._after_diagnostics)
+
+    def _after_diagnostics(self, _outcome) -> None:
+        self._console_write("Diagnostics finished\n", CONSOLE_OK, bold=True)
+        self._schedule_status_refresh(200)
 
     def _sync_game_filter_combo(self) -> None:
         current = load_game_filter(self.project_root)
@@ -665,15 +874,38 @@ class MainWindow(QMainWindow):
         """Re-query SCM shortly after a mutation, coalescing repeated requests."""
         self._status_timer.start(delay_ms)
 
-    def _refresh_service_status(self) -> None:
-        try:
-            status = query_service_status(SERVICE_NAME)
-        except Exception as exc:
-            self.service_status_label.setText(f"Status: error ({exc})")
-            self._log(f"Status query failed: {exc}", error=True)
+    def _poll_service_status(self) -> None:
+        if self._worker is not None:
             return
-        self.service_status_label.setText(f"Status: {status.state} — {status.message}")
-        self._log(f"Service {SERVICE_NAME}: {status.state}")
+        try:
+            snapshot = query_service_snapshot(SERVICE_NAME)
+        except Exception as exc:
+            snapshot = ServiceSnapshot(SERVICE_NAME, "ERROR", error=str(exc))
+        previous = self._last_snapshot
+        self._last_snapshot = snapshot
+        self._render_service_status()
+        if previous is None:
+            self._log(f"Service {SERVICE_NAME}: {snapshot.token.lower()}")
+        elif previous.token != snapshot.token:
+            self._log(f"Service {SERVICE_NAME}: {previous.token.lower()} → {snapshot.token.lower()}")
+
+    def _render_service_status(self) -> None:
+        label = getattr(self, "service_status_label", None)
+        snapshot = self._last_snapshot
+        if label is None or snapshot is None:
+            return
+        key, fallback, state = STATUS_TOKENS.get(snapshot.token, STATUS_ERROR)
+        parts = [f"● {lookup(self, key, fallback)}"]
+        if snapshot.strategy and state != "not_installed":
+            parts.append(snapshot.strategy)
+        # Two installs can own the one service name; show which tree this one is.
+        if snapshot.image and not image_is_under(snapshot.image, self.project_root):
+            parts.append(image_install_root(snapshot.image))
+        label.setText("  ·  ".join(parts))
+        label.setToolTip(snapshot.image or snapshot.error)
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
 
     def _load_list_files(self) -> None:
         self.list_files_widget.clear()
@@ -776,10 +1008,7 @@ class MainWindow(QMainWindow):
         self._log(error, error=True)
         QMessageBox.warning(self, PROJECT_NAME, error)
 
-    def _report_scm(self, verb: str, result: ScmOpResult, *, render_steps: bool = False) -> None:
-        if render_steps:
-            for report in result.steps:
-                self._console_step(report)
+    def _report_scm(self, verb: str, result: ScmOpResult) -> None:
         if result.needs_elevation and not is_process_elevated():
             self._delegated(verb, result.command.command_line)
             return
@@ -798,6 +1027,9 @@ class MainWindow(QMainWindow):
             self._delegated("Remove", result.command_line)
             return
         if result.ok:
+            if result.error:
+                # Like service.bat, a failed side step does not stop the removal.
+                self._console_diag(DiagLine("warn", f"Some steps failed: {result.error}"))
             self._console_write("Remove OK\n", CONSOLE_OK, bold=True)
             self._schedule_status_refresh(200)
             return
@@ -854,6 +1086,13 @@ class MainWindow(QMainWindow):
             if line:
                 self._console_write(f"         {line}\n", CONSOLE_MUTED)
 
+    def _console_diag(self, line: DiagLine) -> None:
+        if line.level == "blank":
+            self._console_write("\n")
+            return
+        color = {"ok": CONSOLE_OK, "warn": CONSOLE_WARN, "fail": CONSOLE_FAIL}.get(line.level, CONSOLE_TEXT)
+        self._console_write(f"{line.text}\n", color)
+
     def _log(self, message: str, *, error: bool = False) -> None:
         prefix = "ERR" if error else "INF"
         self._console_write(f"[{prefix}] {message}\n", CONSOLE_FAIL if error else CONSOLE_MUTED)
@@ -861,6 +1100,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 8000)
 
     def closeEvent(self, event) -> None:
+        self._status_poll.stop()
+        self._status_timer.stop()
+        self._disarm_results_watch()
         # Tearing down a QThread mid-sc.exe aborts the process; let it finish.
         worker = self._worker
         if worker is not None and worker.isRunning():

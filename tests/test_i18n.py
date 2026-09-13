@@ -2,21 +2,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtWidgets import QPushButton
+
+from zapret_gui.app import MainWindow
 from zapret_gui.i18n import (
     BUTTON_OBJECT_NAMES,
     apply_locale,
     default_lang_file,
     load_catalog,
 )
-from zapret_gui.app import MainWindow
-
+from zapret_gui.services import ServiceSnapshot
 
 REQUIRED_BUTTONS = (
     "installButton",
-    "startButton",
-    "stopButton",
     "removeButton",
-    "statusButton",
+    "testsButton",
+    "diagnosticsButton",
     "backupButton",
     "saveButton",
     "backupAllButton",
@@ -31,7 +32,20 @@ REQUIRED_LABELS = (
     "hostsSection",
     "listsSection",
     "consoleSection",
+    "testsHint",
 )
+
+STATUS_KEYS = (
+    "statusRunning",
+    "statusStarting",
+    "statusStopping",
+    "statusStopped",
+    "statusNotInstalled",
+    "statusError",
+)
+PROMPT_KEYS = ("diagConflictsPrompt", "diagDiscordPrompt")
+RETIRED_KEYS = ("startButton", "stopButton", "statusButton")
+TESTS_HINT_EN = "Don't know what strategy to use? Run tests and it will choose the best strategy for you!"
 
 
 def test_lang_file_covers_section_labels() -> None:
@@ -54,9 +68,26 @@ def test_lang_file_covers_all_gui_buttons() -> None:
     for key in REQUIRED_BUTTONS:
         assert catalog["ru"][key] != catalog["en"][key]
     assert set(REQUIRED_BUTTONS) <= set(BUTTON_OBJECT_NAMES)
+    assert not set(RETIRED_KEYS) & set(BUTTON_OBJECT_NAMES)
 
 
-def test_apply_russian_then_english_uses_lang_file(qapp, project_root: Path) -> None:
+def test_lang_file_covers_status_prompts_and_tests_hint() -> None:
+    catalog = load_catalog()
+    assert catalog["en"]["testsHint"] == TESTS_HINT_EN
+    for key in STATUS_KEYS + PROMPT_KEYS + ("testsHint",):
+        for locale in ("en", "ru"):
+            assert catalog[locale].get(key, "").strip(), f"{locale} missing {key}"
+        assert catalog["ru"][key] != catalog["en"][key], f"{key} is not translated"
+    for key in RETIRED_KEYS:
+        for locale in ("en", "ru"):
+            assert key not in catalog[locale], f"{locale} still carries retired {key}"
+
+
+def test_apply_russian_then_english_uses_lang_file(qapp, project_root: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "zapret_gui.app.query_service_snapshot",
+        lambda *_a, **_k: ServiceSnapshot("zapret", "RUNNING", strategy="general (ALT2)"),
+    )
     catalog = load_catalog()
     window = MainWindow(project_root=project_root)
     try:
@@ -74,12 +105,13 @@ def test_apply_russian_then_english_uses_lang_file(qapp, project_root: Path) -> 
         for key in REQUIRED_BUTTONS:
             widget = getattr(window, _attr(key), None)
             if widget is None:
-                from PySide6.QtWidgets import QPushButton
-
                 widget = window.findChild(QPushButton, key)
             assert widget is not None, f"missing button {key}"
             assert widget.text() == ru[key]
             assert widget.text() == catalog["ru"][key]
+        assert window.tests_hint.text() == ru["testsHint"]
+        assert window.tests_button.toolTip() == ru["testsHint"]
+        assert ru["statusRunning"] in window.service_status_label.text()
 
         strategies_ru = [
             window.strategy_combo.itemText(i) for i in range(window.strategy_combo.count())
@@ -93,12 +125,13 @@ def test_apply_russian_then_english_uses_lang_file(qapp, project_root: Path) -> 
 
         en = apply_locale(window, "en", catalog)
         for key in REQUIRED_BUTTONS:
-            from PySide6.QtWidgets import QPushButton
-
             widget = window.findChild(QPushButton, key)
             assert widget is not None
             assert widget.text() == en[key]
             assert widget.text() == catalog["en"][key]
+        assert window.tests_hint.text() == TESTS_HINT_EN
+        assert window.tests_button.toolTip() == TESTS_HINT_EN
+        assert en["statusRunning"] in window.service_status_label.text()
         assert [
             window.strategy_combo.itemText(i) for i in range(window.strategy_combo.count())
         ] == strategies_before
@@ -120,6 +153,7 @@ def test_language_button_toggles_via_shipped_handler(qapp, project_root: Path) -
         assert window._locale == "ru"
         assert window.install_button.text() == catalog["ru"]["installButton"]
         assert window.hosts_button.text() == catalog["ru"]["hostsButton"]
+        assert window.tests_button.text() == catalog["ru"]["testsButton"]
         assert window.language_button.text() == catalog["ru"]["languageButton"]
         window.language_button.click()
         assert window._locale == "en"
@@ -131,10 +165,9 @@ def test_language_button_toggles_via_shipped_handler(qapp, project_root: Path) -
 def _attr(object_name: str) -> str:
     mapping = {
         "installButton": "install_button",
-        "startButton": "start_button",
-        "stopButton": "stop_button",
         "removeButton": "remove_button",
-        "statusButton": "status_button",
+        "testsButton": "tests_button",
+        "diagnosticsButton": "diagnostics_button",
         "backupButton": "backup_button",
         "saveButton": "save_button",
         "backupAllButton": "backup_all_button",
